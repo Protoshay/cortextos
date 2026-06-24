@@ -414,7 +414,9 @@ export class AgentManager {
           log('Duplicate Telegram message suppressed');
           return;
         }
-        checker.queueTelegramMessage(formatted);
+        // Pass the chat_id as the debounce key so rapid-fire messages from
+        // the same chat are buffered and delivered as a single batched turn.
+        checker.queueTelegramMessage(formatted, String(effectiveChatId));
       });
 
       poller.onCallback((query) => {
