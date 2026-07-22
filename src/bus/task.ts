@@ -264,6 +264,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  desc?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -279,6 +280,7 @@ export function updateTask(
     prevStatus = task.status;
     assignee = task.assigned_to;
     task.status = status;
+    if (desc !== undefined) task.description = desc;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -514,6 +516,7 @@ export function listTasks(
     agent?: string;
     status?: TaskStatus;
     priority?: Priority;
+    project?: string;
     respectDeps?: boolean;
   },
 ): Task[] {
@@ -537,6 +540,7 @@ export function listTasks(
       if (filters?.agent && task.assigned_to !== filters.agent) continue;
       if (filters?.status && task.status !== filters.status) continue;
       if (filters?.priority && task.priority !== filters.priority) continue;
+      if (filters?.project && task.project !== filters.project) continue;
       if (task.archived) continue;
 
       tasks.push(task);

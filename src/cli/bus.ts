@@ -181,7 +181,8 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--desc <text>', 'Update task description')
+  .action((id: string, status: string, opts: { desc?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -201,7 +202,7 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
+    updateTask(paths, id, status as TaskStatus, opts.desc);
     console.log(`Updated ${id} -> ${status}`);
   });
 
@@ -350,14 +351,16 @@ busCommand
   .command('list-tasks')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .action((opts: { agent?: string; status?: string; project?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
     });
 
