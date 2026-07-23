@@ -221,10 +221,19 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
  * to re-queue messages that were auto-ACK'd *after* the agent last proved it was
  * processing work — anything ACK'd before that was genuinely consumed.
  *
- * Takes the max of three independent "live" signals:
+ * Takes the max of two independent IN-SESSION "live" signals:
  *   1. state/<agent>/.last-send   — last confirmed OUTBOUND message (see stampLastSend)
- *   2. state/<agent>/heartbeat.json mtime — last heartbeat write
- *   3. analytics/events/<agent>/<today>.jsonl mtime — last logged event
+ *   2. analytics/events/<agent>/<today>.jsonl mtime — last logged event
+ *
+ * Deliberately does NOT use heartbeat.json mtime: the fast-checker runs an
+ * idle-session watchdog (fast-checker.ts) that stamps heartbeat.json every ~50min
+ * "regardless of REPL state" — i.e. it keeps writing while the agent session is
+ * FROZEN. Its mtime tracks the fast-checker PROCESS, not the agent session, so
+ * trusting it would open the re-queue window too recently (<=50min) and skip the
+ * earlier losses in a long wedge — defeating the fix exactly where it's needed
+ * (kacey's 2.5h wedge, real losses at 05:35/05:38). Both signals used here are
+ * written only by the agent session itself (update-heartbeat logs no event, so
+ * the event-log stays clean of the watchdog).
  *
  * Returns 0 if no signal is available (caller must fall back to a fixed window cap).
  */
@@ -240,16 +249,7 @@ export function getLastConfirmedLive(ctxRoot: string, agentName: string): number
     }
   } catch { /* ignore */ }
 
-  // Signal 2: heartbeat.json mtime
-  try {
-    const hbPath = join(ctxRoot, 'state', agentName, 'heartbeat.json');
-    if (existsSync(hbPath)) {
-      const m = statSync(hbPath).mtimeMs;
-      if (m > newest) newest = m;
-    }
-  } catch { /* ignore */ }
-
-  // Signal 3: today's event-log mtime
+  // Signal 2: today's event-log mtime
   try {
     const today = new Date().toISOString().slice(0, 10);
     const evPath = join(ctxRoot, 'analytics', 'events', agentName, `${today}.jsonl`);

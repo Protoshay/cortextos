@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { sendMessage, checkInbox, ackInbox, getLastConfirmedLive, requeueWedgedMessages } from '../../../src/bus/message';
@@ -152,6 +152,17 @@ describe('Message Bus', () => {
 
     it('returns 0 when no live signal exists', () => {
       expect(getLastConfirmedLive(testDir, 'nobody')).toBe(0);
+    });
+
+    it('IGNORES heartbeat.json — a fresh heartbeat must NOT narrow the window', () => {
+      // The fast-checker idle watchdog stamps heartbeat.json every ~50min even
+      // while the session is FROZEN, so heartbeat mtime is a false live signal.
+      // A fresh heartbeat.json with no in-session signal must yield 0 (not "now").
+      const stateDir = join(testDir, 'state', 'wedged');
+      mkdirSync(stateDir, { recursive: true });
+      writeFileSync(join(stateDir, 'heartbeat.json'), JSON.stringify({ status: 'online' }));
+
+      expect(getLastConfirmedLive(testDir, 'wedged')).toBe(0);
     });
   });
 
