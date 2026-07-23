@@ -121,7 +121,7 @@ export class AgentProcess {
     // at MAX_REQUEUE_WINDOW_MS as a safety floor when no live signal exists.
     if (mode === 'fresh' && isForceFresh) {
       try {
-        const lastLive = getLastConfirmedLive(this.env.ctxRoot, this.name);
+        const lastLive = getLastConfirmedLive(this.env.ctxRoot, this.name, this.env.org);
         const sinceMs = lastLive > 0
           ? Math.max(lastLive, Date.now() - MAX_REQUEUE_WINDOW_MS)
           : Date.now() - MAX_REQUEUE_WINDOW_MS;

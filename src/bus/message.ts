@@ -223,7 +223,7 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
  *
  * Takes the max of two independent IN-SESSION "live" signals:
  *   1. state/<agent>/.last-send   — last confirmed OUTBOUND message (see stampLastSend)
- *   2. analytics/events/<agent>/<today>.jsonl mtime — last logged event
+ *   2. <analytics>/events/<agent>/<today>.jsonl mtime — last logged event
  *
  * Deliberately does NOT use heartbeat.json mtime: the fast-checker runs an
  * idle-session watchdog (fast-checker.ts) that stamps heartbeat.json every ~50min
@@ -235,9 +235,17 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
  * written only by the agent session itself (update-heartbeat logs no event, so
  * the event-log stays clean of the watchdog).
  *
+ * CRITICAL — analytics is ORG-SCOPED: logEvent writes to analyticsDir =
+ * orgs/<org>/analytics when an org is set (paths.ts resolvePaths; true for all
+ * fleet agents). The caller therefore MUST pass `org` or signal 2 reads an empty
+ * legacy top-level path and permanently degrades the window to .last-send-only
+ * (silent-zero via wrong path — the same class this whole fix guards against). We
+ * check the org-scoped path first, then the top-level path as a fallback for
+ * org-less installs (mirrors the read in bus/metrics.ts).
+ *
  * Returns 0 if no signal is available (caller must fall back to a fixed window cap).
  */
-export function getLastConfirmedLive(ctxRoot: string, agentName: string): number {
+export function getLastConfirmedLive(ctxRoot: string, agentName: string, org?: string): number {
   let newest = 0;
 
   // Signal 1: last confirmed outbound (.last-send holds epochMs as a string)
@@ -249,13 +257,19 @@ export function getLastConfirmedLive(ctxRoot: string, agentName: string): number
     }
   } catch { /* ignore */ }
 
-  // Signal 2: today's event-log mtime
+  // Signal 2: today's event-log mtime. Org-scoped path first (where logEvent
+  // actually writes for fleet agents), then the legacy top-level path.
   try {
     const today = new Date().toISOString().slice(0, 10);
-    const evPath = join(ctxRoot, 'analytics', 'events', agentName, `${today}.jsonl`);
-    if (existsSync(evPath)) {
-      const m = statSync(evPath).mtimeMs;
-      if (m > newest) newest = m;
+    const evPaths = [
+      ...(org ? [join(ctxRoot, 'orgs', org, 'analytics', 'events', agentName, `${today}.jsonl`)] : []),
+      join(ctxRoot, 'analytics', 'events', agentName, `${today}.jsonl`),
+    ];
+    for (const evPath of evPaths) {
+      if (existsSync(evPath)) {
+        const m = statSync(evPath).mtimeMs;
+        if (m > newest) newest = m;
+      }
     }
   } catch { /* ignore */ }
 

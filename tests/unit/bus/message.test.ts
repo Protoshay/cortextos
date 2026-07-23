@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync, mkdirSyn
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { sendMessage, checkInbox, ackInbox, getLastConfirmedLive, requeueWedgedMessages } from '../../../src/bus/message';
+import { logEvent } from '../../../src/bus/event';
 import { resolvePaths } from '../../../src/utils/paths';
 import type { BusPaths } from '../../../src/types';
 
@@ -152,6 +153,28 @@ describe('Message Bus', () => {
 
     it('returns 0 when no live signal exists', () => {
       expect(getLastConfirmedLive(testDir, 'nobody')).toBe(0);
+    });
+
+    it('picks up an org-scoped event via the REAL logEvent writer (path positive control)', () => {
+      // logEvent writes to analyticsDir/events/<agent>/<date>.jsonl, and analyticsDir
+      // is ORG-SCOPED (orgs/<org>/analytics) for every fleet agent. getLastConfirmedLive
+      // must resolve that same org path — this test drives the REAL writer with an org
+      // set so path drift can never silently zero signal 2 in production again.
+      const org = 'test-org';
+      const orgPaths: BusPaths = {
+        ...senderPaths,
+        stateDir: join(testDir, 'state', 'evtagent'),
+        analyticsDir: join(testDir, 'orgs', org, 'analytics'),
+      };
+      logEvent(orgPaths, 'evtagent', org, 'action', 'session_start', 'info');
+
+      // With the org, signal 2 finds the real (org-scoped) event file.
+      expect(getLastConfirmedLive(testDir, 'evtagent', org)).toBeGreaterThan(0);
+
+      // Negative control: without the org, the legacy top-level path is empty and
+      // there is no .last-send — so the signal correctly returns 0. This is the exact
+      // failure that regressed the merged fix (org-less read = permanent silent zero).
+      expect(getLastConfirmedLive(testDir, 'evtagent')).toBe(0);
     });
 
     it('IGNORES heartbeat.json — a fresh heartbeat must NOT narrow the window', () => {
