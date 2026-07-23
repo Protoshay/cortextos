@@ -3,7 +3,7 @@ import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
-import { validateAgentName } from '../utils/validate.js';
+import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
@@ -31,6 +31,9 @@ import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, Approval
  * Returns an error message if the transition should be blocked, or null if allowed.
  */
 function checkDeliverableRequirement(taskId: string, frameworkRoot: string, org: string, taskDir: string): string | null {
+  // Reject a traversal task id before it builds the task-file path below — this
+  // runs ahead of updateTask/completeTask, so it can't rely on findTaskFile's guard.
+  validateTaskId(taskId);
   // Read org context to check require_deliverables setting
   const contextPath = join(frameworkRoot, 'orgs', org, 'context.json');
   if (!existsSync(contextPath)) return null;
@@ -178,7 +181,8 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--desc <text>', 'Update task description')
+  .action((id: string, status: string, opts: { desc?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -198,7 +202,7 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
+    updateTask(paths, id, status as TaskStatus, opts.desc);
     console.log(`Updated ${id} -> ${status}`);
   });
 
@@ -347,14 +351,16 @@ busCommand
   .command('list-tasks')
   .option('--agent <name>', 'Filter by agent')
   .option('--status <s>', 'Filter by status')
+  .option('--project <name>', 'Filter by project')
   .option('--format <fmt>', 'Output format: json or text', 'text')
   .option('--respect-deps', 'Sort DAG-aware: unblocked tasks first, blocked tasks last')
-  .action((opts: { agent?: string; status?: string; format?: string; respectDeps?: boolean }) => {
+  .action((opts: { agent?: string; status?: string; project?: string; format?: string; respectDeps?: boolean }) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = listTasks(paths, {
       agent: opts.agent,
       status: opts.status as TaskStatus,
+      project: opts.project,
       respectDeps: opts.respectDeps ?? false,
     });
 

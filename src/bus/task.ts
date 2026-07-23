@@ -3,7 +3,7 @@ import { join } from 'path';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
-import { validatePriority } from '../utils/validate.js';
+import { validatePriority, validateTaskId } from '../utils/validate.js';
 import { logEvent } from './event.js';
 
 /**
@@ -221,6 +221,9 @@ export function checkTaskDependencies(
  * task-graph visualization, or cross-org list-tasks flag).
  */
 export function findTaskFile(paths: BusPaths, taskId: string): string | null {
+  // Reject path-traversal task ids before they reach any join() below. This is
+  // the chokepoint for updateTask/claimTask/completeTask/checkTaskDependencies.
+  validateTaskId(taskId);
   // Fast path: same-org lookup.
   const sameOrg = join(paths.taskDir, `${taskId}.json`);
   if (existsSync(sameOrg)) return sameOrg;
@@ -261,6 +264,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  desc?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -276,6 +280,7 @@ export function updateTask(
     prevStatus = task.status;
     assignee = task.assigned_to;
     task.status = status;
+    if (desc !== undefined) task.description = desc;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
@@ -313,6 +318,9 @@ export function appendTaskAudit(
   taskId: string,
   entry: Omit<TaskAuditEntry, 'ts'>,
 ): void {
+  // Validate before the try so a traversal id is rejected loudly rather than
+  // swallowed by the audit-never-blocks catch below.
+  validateTaskId(taskId);
   try {
     const auditDir = join(paths.taskDir, 'audit');
     ensureDir(auditDir);
@@ -336,6 +344,7 @@ export function readTaskAudit(
   paths: BusPaths,
   taskId: string,
 ): TaskAuditEntry[] {
+  validateTaskId(taskId);
   const path = join(paths.taskDir, 'audit', `${taskId}.jsonl`);
   if (!existsSync(path)) return [];
   const entries: TaskAuditEntry[] = [];
@@ -507,6 +516,7 @@ export function listTasks(
     agent?: string;
     status?: TaskStatus;
     priority?: Priority;
+    project?: string;
     respectDeps?: boolean;
   },
 ): Task[] {
@@ -530,6 +540,7 @@ export function listTasks(
       if (filters?.agent && task.assigned_to !== filters.agent) continue;
       if (filters?.status && task.status !== filters.status) continue;
       if (filters?.priority && task.priority !== filters.priority) continue;
+      if (filters?.project && task.project !== filters.project) continue;
       if (task.archived) continue;
 
       tasks.push(task);
@@ -673,6 +684,9 @@ export function archiveTasks(paths: BusPaths, dryRun: boolean = false): ArchiveR
     const age = nowEpoch - completedEpoch;
 
     if (age > ARCHIVE_AGE) {
+      // task.id comes from the file's JSON body and is used to build the
+      // rename source/dest below; a tampered id must not escape the task tree.
+      try { validateTaskId(task.id); } catch { skipped++; continue; }
       if (!dryRun) {
         const archiveDir = join(paths.taskDir, 'archive');
         ensureDir(archiveDir);
@@ -780,7 +794,18 @@ export function compactTasks(
       continue;
     }
 
+    // task.id (from the file's JSON body) is used to unlink the source file
+    // below; a tampered id must not delete a file outside the task tree.
+    try { validateTaskId(task.id); } catch { report.skipped.push({ id: String(task.id), reason: 'invalid task id (path-traversal guard)' }); continue; }
+
     const yyyymm = task.completed_at.substring(0, 7); // YYYY-MM
+    // completed_at is from the JSON body and feeds the archive filename below;
+    // reject anything that isn't a literal YYYY-MM so a tampered timestamp can't
+    // traverse out of the task tree via the archive path.
+    if (!/^\d{4}-\d{2}$/.test(yyyymm)) {
+      report.skipped.push({ id: String(task.id), reason: 'invalid completed_at (path-traversal guard)' });
+      continue;
+    }
     const archiveFile = `archive-${yyyymm}.jsonl`;
     const archivePath = join(taskDir, archiveFile);
     const entry = {
