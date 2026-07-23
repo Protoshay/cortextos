@@ -10,9 +10,18 @@ import type { TelegramAPI } from '../telegram/api.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
+import { getLastConfirmedLive, requeueWedgedMessages } from '../bus/message.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
+
+/**
+ * Safety cap on the wedge-recovery re-queue window. If no "last confirmed live"
+ * signal is available, we only look back this far for auto-ACK'd messages to
+ * re-queue — bounding blast radius so a fresh boot can't drag very old,
+ * legitimately-processed messages back into the inbox.
+ */
+const MAX_REQUEUE_WINDOW_MS = 12 * 60 * 60 * 1000; // 12h
 
 /**
  * Manages a single agent's lifecycle.
@@ -91,11 +100,39 @@ export class AgentProcess {
       writeCortextosEnv(this.env.agentDir, this.env);
     }
 
+    // Wedge-recovery: capture whether a force-fresh marker is present BEFORE
+    // shouldContinue() reads-and-deletes it. A force-fresh restart is how we
+    // recover a wedged (frozen) session — and a wedged session is exactly the
+    // case where the fast-checker may have auto-ACK'd inbound messages that the
+    // frozen buffer never consumed. We re-queue those below so the fresh session
+    // receives them instead of dropping them with the dead buffer.
+    const forceFreshPath = join(this.env.ctxRoot, 'state', this.name, '.force-fresh');
+    const isForceFresh = existsSync(forceFreshPath);
+
     // Determine start mode
     const mode = this.shouldContinue() ? 'continue' : 'fresh';
     const prompt = mode === 'fresh'
       ? this.buildStartupPrompt()
       : this.buildContinuePrompt();
+
+    // Wedge-recovery re-queue: only on a force-fresh restart (the wedge-recovery
+    // path). Bound the window to [last-confirmed-live, now] so we only re-queue
+    // messages auto-ACK'd AFTER the agent last proved it was processing — capped
+    // at MAX_REQUEUE_WINDOW_MS as a safety floor when no live signal exists.
+    if (mode === 'fresh' && isForceFresh) {
+      try {
+        const lastLive = getLastConfirmedLive(this.env.ctxRoot, this.name);
+        const sinceMs = lastLive > 0
+          ? Math.max(lastLive, Date.now() - MAX_REQUEUE_WINDOW_MS)
+          : Date.now() - MAX_REQUEUE_WINDOW_MS;
+        const requeued = requeueWedgedMessages(this.env.ctxRoot, this.name, sinceMs);
+        if (requeued.length > 0) {
+          this.log(`Wedge-recovery: re-queued ${requeued.length} in-window auto-ACK'd message(s): ${requeued.join(', ')}`);
+        }
+      } catch (err) {
+        this.log(`Wedge-recovery re-queue failed (non-fatal): ${err}`);
+      }
+    }
 
     this.log(`Starting in ${mode} mode`);
     this.status = 'starting';

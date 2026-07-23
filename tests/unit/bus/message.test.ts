@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { sendMessage, checkInbox, ackInbox } from '../../../src/bus/message';
+import { sendMessage, checkInbox, ackInbox, getLastConfirmedLive, requeueWedgedMessages } from '../../../src/bus/message';
 import { resolvePaths } from '../../../src/utils/paths';
 import type { BusPaths } from '../../../src/types';
 
@@ -137,6 +137,80 @@ describe('Message Bus', () => {
 
       expect(inflightFiles.length).toBe(0);
       expect(processedFiles.length).toBe(1);
+    });
+  });
+
+  describe('getLastConfirmedLive', () => {
+    it('returns the sender last-send stamp after a send', () => {
+      const before = Date.now();
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'test');
+      const live = getLastConfirmedLive(testDir, 'sender');
+      // .last-send is stamped with the send epochMs — within a small window of now.
+      expect(live).toBeGreaterThanOrEqual(before - 1000);
+      expect(live).toBeLessThanOrEqual(Date.now() + 1000);
+    });
+
+    it('returns 0 when no live signal exists', () => {
+      expect(getLastConfirmedLive(testDir, 'nobody')).toBe(0);
+    });
+  });
+
+  describe('requeueWedgedMessages', () => {
+    // Simulates the wedge-recovery path: a frozen session had its inbound message
+    // auto-ACK'd (inbox -> inflight -> processed) without ever consuming it. On the
+    // force-fresh restart we re-queue processed messages ACK'd inside the wedge
+    // window so the fresh session receives them.
+
+    it('(a) re-queues an in-window auto-ACK\'d message back to inbox', () => {
+      const msgId = sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'lost-in-wedge');
+      checkInbox(receiverPaths); // -> inflight
+      ackInbox(receiverPaths, msgId); // -> processed (auto-ACK during wedge)
+
+      // Window opens 1 minute ago; the ACK just happened, so it's in-window.
+      const sinceMs = Date.now() - 60_000;
+      const requeued = requeueWedgedMessages(testDir, 'receiver', sinceMs);
+
+      expect(requeued.length).toBe(1);
+      const inboxFiles = readdirSync(receiverPaths.inbox).filter(f => f.endsWith('.json'));
+      const processedFiles = readdirSync(receiverPaths.processed).filter(f => f.endsWith('.json'));
+      expect(inboxFiles.length).toBe(1); // back in inbox for redelivery
+      expect(processedFiles.length).toBe(0); // moved out of processed
+
+      // And the re-queued message is now deliverable again.
+      const messages = checkInbox(receiverPaths);
+      expect(messages.length).toBe(1);
+      expect(messages[0].text).toBe('lost-in-wedge');
+    });
+
+    it('(b) leaves an out-of-window (pre-wedge) ACK untouched', () => {
+      const msgId = sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'legitimately-processed');
+      checkInbox(receiverPaths); // -> inflight
+      ackInbox(receiverPaths, msgId); // -> processed
+
+      // Window opens in the FUTURE — the ACK (now) predates it, so it's out of window
+      // and must NOT be dragged back into the inbox.
+      const sinceMs = Date.now() + 60_000;
+      const requeued = requeueWedgedMessages(testDir, 'receiver', sinceMs);
+
+      expect(requeued.length).toBe(0);
+      const inboxFiles = readdirSync(receiverPaths.inbox).filter(f => f.endsWith('.json'));
+      const processedFiles = readdirSync(receiverPaths.processed).filter(f => f.endsWith('.json'));
+      expect(inboxFiles.length).toBe(0); // stays out of inbox
+      expect(processedFiles.length).toBe(1); // stays processed
+    });
+
+    it('(c) does not disturb a still-pending message (orphaned-lock path)', () => {
+      // The orphaned-lock wedge class self-heals via normal inbox redelivery — its
+      // messages are still PENDING in inbox, never auto-ACK'd. Re-queue only reads
+      // processed/, so it must be a no-op on inbox/inflight.
+      sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'still-pending');
+
+      const sinceMs = Date.now() - 60_000;
+      const requeued = requeueWedgedMessages(testDir, 'receiver', sinceMs);
+
+      expect(requeued.length).toBe(0);
+      const inboxFiles = readdirSync(receiverPaths.inbox).filter(f => f.endsWith('.json'));
+      expect(inboxFiles.length).toBe(1); // untouched, still pending in inbox
     });
   });
 });

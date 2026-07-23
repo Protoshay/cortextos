@@ -84,7 +84,27 @@ export function sendMessage(
   ensureDir(inboxDir);
   atomicWriteSync(join(inboxDir, filename), JSON.stringify(message));
 
+  // Wedge-recovery bookkeeping: stamp the SENDER's last-send time. This is the
+  // "last confirmed outbound" signal used to bound the re-queue window when a
+  // wedged session is force-fresh restarted (see requeueWedgedMessages).
+  stampLastSend(paths.ctxRoot, from, epochMs);
+
   return msgId;
+}
+
+/**
+ * Record the timestamp of an agent's most recent outbound message.
+ * Written to state/<agent>/.last-send. Used as a "last confirmed live" signal
+ * to bound the wedge-recovery re-queue window. Best-effort — never throws.
+ */
+function stampLastSend(ctxRoot: string, from: string, epochMs: number): void {
+  try {
+    const stateDir = join(ctxRoot, 'state', from);
+    ensureDir(stateDir);
+    atomicWriteSync(join(stateDir, '.last-send'), String(epochMs));
+  } catch {
+    // Non-fatal: the re-queue window falls back to other live signals.
+  }
 }
 
 /**
@@ -192,6 +212,105 @@ export function ackInbox(paths: BusPaths, messageId: string): void {
       // Skip corrupt files
     }
   }
+}
+
+/**
+ * Wedge-recovery: determine the newest moment an agent was confirmed alive.
+ *
+ * Used to LOWER-bound the re-queue window on a force-fresh restart. We only want
+ * to re-queue messages that were auto-ACK'd *after* the agent last proved it was
+ * processing work — anything ACK'd before that was genuinely consumed.
+ *
+ * Takes the max of three independent "live" signals:
+ *   1. state/<agent>/.last-send   — last confirmed OUTBOUND message (see stampLastSend)
+ *   2. state/<agent>/heartbeat.json mtime — last heartbeat write
+ *   3. analytics/events/<agent>/<today>.jsonl mtime — last logged event
+ *
+ * Returns 0 if no signal is available (caller must fall back to a fixed window cap).
+ */
+export function getLastConfirmedLive(ctxRoot: string, agentName: string): number {
+  let newest = 0;
+
+  // Signal 1: last confirmed outbound (.last-send holds epochMs as a string)
+  try {
+    const lastSendPath = join(ctxRoot, 'state', agentName, '.last-send');
+    if (existsSync(lastSendPath)) {
+      const val = parseInt(readFileSync(lastSendPath, 'utf-8').trim(), 10);
+      if (Number.isFinite(val) && val > newest) newest = val;
+    }
+  } catch { /* ignore */ }
+
+  // Signal 2: heartbeat.json mtime
+  try {
+    const hbPath = join(ctxRoot, 'state', agentName, 'heartbeat.json');
+    if (existsSync(hbPath)) {
+      const m = statSync(hbPath).mtimeMs;
+      if (m > newest) newest = m;
+    }
+  } catch { /* ignore */ }
+
+  // Signal 3: today's event-log mtime
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const evPath = join(ctxRoot, 'analytics', 'events', agentName, `${today}.jsonl`);
+    if (existsSync(evPath)) {
+      const m = statSync(evPath).mtimeMs;
+      if (m > newest) newest = m;
+    }
+  } catch { /* ignore */ }
+
+  return newest;
+}
+
+/**
+ * Wedge-recovery: re-queue messages that were auto-ACK'd while an agent's session
+ * was wedged (frozen), so a force-fresh restart re-delivers them instead of
+ * silently discarding them with the dead input buffer.
+ *
+ * Background: injectMessage() writes keystrokes to a PTY whose status is still
+ * 'running' even when the session is frozen at a context-limit / auto-update
+ * banner. The write "succeeds" (returns true) but is never CONSUMED, so the
+ * fast-checker auto-ACKs the message (inbox -> inflight -> processed) in the same
+ * poll cycle. The 5-min un-ACK'd redelivery therefore never fires, and the
+ * force-fresh restart drops the frozen buffer — the message is lost.
+ *
+ * This moves any processed/<agent>/*.json whose ACK happened at or after sinceMs
+ * back into inbox/<agent>/ so the fresh session receives it. We key on ctime, not
+ * mtime: renameSync (the inbox->inflight->processed path) PRESERVES mtime but
+ * updates ctime, so ctime is the true ACK/move timestamp.
+ *
+ * Returns the list of message filenames re-queued.
+ */
+export function requeueWedgedMessages(ctxRoot: string, agentName: string, sinceMs: number): string[] {
+  const processedDir = join(ctxRoot, 'processed', agentName);
+  const inboxDir = join(ctxRoot, 'inbox', agentName);
+  const requeued: string[] = [];
+
+  let files: string[];
+  try {
+    files = readdirSync(processedDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+  } catch {
+    return requeued;
+  }
+  if (files.length === 0) return requeued;
+
+  ensureDir(inboxDir);
+
+  for (const file of files) {
+    const srcPath = join(processedDir, file);
+    try {
+      const ctimeMs = statSync(srcPath).ctimeMs;
+      // Only re-queue messages ACK'd within the wedge window [sinceMs, now].
+      if (ctimeMs >= sinceMs) {
+        renameSync(srcPath, join(inboxDir, file));
+        requeued.push(file);
+      }
+    } catch {
+      // Ignore stat/move errors — best-effort recovery.
+    }
+  }
+
+  return requeued;
 }
 
 /**
