@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { logEvent } from '../../../src/bus/event';
+import { logEvent, refreshHeartbeatTimestamp } from '../../../src/bus/event';
 import type { BusPaths, Heartbeat } from '../../../src/types';
 
 /**
@@ -119,6 +119,60 @@ describe('Bus events', () => {
       const eventFile = join(paths.analyticsDir, 'events', 'spark', `${today}.jsonl`);
       const entries = readFileSync(eventFile, 'utf-8').trim().split('\n');
       expect(entries).toHaveLength(1);
+    });
+  });
+
+  describe('refreshHeartbeatTimestamp (idle-session watchdog bump)', () => {
+    // The FastChecker idle-session watchdog fires every 50min and now calls
+    // refreshHeartbeatTimestamp(this.paths, ts) DIRECTLY (in-process, on the
+    // agent's own resolved paths) instead of shelling out to
+    // `cortextos bus update-heartbeat`. That shell-out had two bugs:
+    //   1) cross-write — all 11 FastCheckers share the one daemon process env, so
+    //      the CLI resolved the target from ambient CTX_AGENT_NAME and every
+    //      watchdog stamp landed on ONE shared heartbeat.json.
+    //   2) status-clobber — update-heartbeat overwrote the agent's meaningful
+    //      status line every 50min (this is what buried a live agent's real
+    //      status under "[watchdog] X alive").
+    // This test locks the contract the watchdog now depends on: bump
+    // last_heartbeat ONLY, preserve status and every other field.
+    it('bumps last_heartbeat while preserving status and all other fields', async () => {
+      const before: Heartbeat = {
+        agent: 'spark',
+        org: 'eros-os',
+        status: 'Live session — closing Rosie Ingram deal',
+        current_task: 'deal/rosie-ingram',
+        mode: 'day',
+        last_heartbeat: '2026-04-23T12:00:00Z',
+        loop_interval: '4h',
+      };
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(before));
+
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      const ts = new Date().toISOString();
+      refreshHeartbeatTimestamp(paths, ts);
+
+      const after = JSON.parse(
+        readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8'),
+      ) as Heartbeat;
+
+      // Timestamp bumped to exactly the value the watchdog passed…
+      expect(after.last_heartbeat).toBe(ts);
+      expect(new Date(after.last_heartbeat).getTime()).toBeGreaterThan(
+        new Date(before.last_heartbeat).getTime(),
+      );
+      // …and the meaningful status line is NOT clobbered (the regression skiffy hit).
+      expect(after.status).toBe('Live session — closing Rosie Ingram deal');
+      expect(after.current_task).toBe('deal/rosie-ingram');
+      expect(after.mode).toBe('day');
+      expect(after.loop_interval).toBe('4h');
+      expect(after.agent).toBe('spark');
+      expect(after.org).toBe('eros-os');
+    });
+
+    it('is a no-op when no heartbeat.json exists yet (does not create one)', () => {
+      expect(existsSync(join(paths.stateDir, 'heartbeat.json'))).toBe(false);
+      expect(() => refreshHeartbeatTimestamp(paths, new Date().toISOString())).not.toThrow();
+      expect(existsSync(join(paths.stateDir, 'heartbeat.json'))).toBe(false);
     });
   });
 });

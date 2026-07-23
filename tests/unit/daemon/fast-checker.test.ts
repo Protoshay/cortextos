@@ -789,48 +789,64 @@ describe('FastChecker', () => {
     beforeEach(() => { vi.useFakeTimers(); });
     afterEach(() => { vi.useRealTimers(); vi.clearAllMocks(); });
 
-    it('fires exec after bootstrap at 50-min interval', async () => {
-      const { execFile } = await import('child_process');
+    // The watchdog no longer shells out to `cortextos bus update-heartbeat`
+    // (that inherited the daemon's ambient CTX_AGENT_NAME → cross-write onto one
+    // shared file, and clobbered the agent's status line every 50min). It now
+    // bumps last_heartbeat IN-PROCESS on the agent's own heartbeat.json and logs
+    // the "[watchdog] X alive" line to the fast-checker log. These tests assert
+    // that in-process behavior + status preservation.
+    const watchdogLogs = (spy: ReturnType<typeof vi.fn>): string[] =>
+      spy.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('[watchdog]'));
+
+    it('bumps last_heartbeat in-process + logs alive line at 50-min interval, preserving status', async () => {
+      // Seed the agent's own heartbeat.json with a meaningful status line.
+      const hbPath = join(paths.stateDir, 'heartbeat.json');
+      writeFileSync(hbPath, JSON.stringify({
+        agent: 'my-agent', org: 'TestOrg', status: 'Live session — real work',
+        mode: 'day', last_heartbeat: '2026-04-23T12:00:00Z', loop_interval: '4h',
+      }));
+
+      const logSpy = vi.fn();
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { log: logSpy });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
-      expect(execFile).toHaveBeenCalledWith(
-        'cortextos',
-        expect.arrayContaining(['bus', 'update-heartbeat', expect.stringContaining('[watchdog] my-agent alive — idle session')]),
-        expect.any(Function),
-      );
+
+      // Logged the alive line to the fast-checker log (NOT into the status field).
+      expect(watchdogLogs(logSpy).some((m) => m.includes('[watchdog] my-agent alive — idle session'))).toBe(true);
+
+      // Bumped last_heartbeat on the agent's OWN file, status preserved (no clobber).
+      const hb = JSON.parse(readFileSync(hbPath, 'utf-8'));
+      expect(new Date(hb.last_heartbeat).getTime()).toBeGreaterThan(new Date('2026-04-23T12:00:00Z').getTime());
+      expect(hb.status).toBe('Live session — real work');
+      expect(hb.mode).toBe('day');
+
       checker.stop();
       checker.wake();
     });
 
-    it('clears timer on stop — no further exec calls after stop', async () => {
-      const { execFile } = await import('child_process');
-      const execMock = execFile as ReturnType<typeof vi.fn>;
+    it('clears timer on stop — no further watchdog fires after stop', async () => {
+      const logSpy = vi.fn();
       const agent = createMockAgent('my-agent');
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { log: logSpy });
       checker.start();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
-      const callsBefore = execMock.mock.calls.length;
-      expect(callsBefore).toBeGreaterThan(0);
+      const firesBefore = watchdogLogs(logSpy).length;
+      expect(firesBefore).toBeGreaterThan(0);
       checker.stop();
       checker.wake();
       await vi.advanceTimersByTimeAsync(50 * 60 * 1000);
-      expect(execMock.mock.calls.length).toBe(callsBefore);
+      expect(watchdogLogs(logSpy).length).toBe(firesBefore);
     });
 
     it('does not fire before bootstrap completes', async () => {
-      const { execFile } = await import('child_process');
+      const logSpy = vi.fn();
       const agent = createMockAgent('my-agent');
       agent.isBootstrapped.mockReturnValue(false);
-      const checker = new FastChecker(agent, paths, '/tmp/framework');
+      const checker = new FastChecker(agent, paths, '/tmp/framework', { log: logSpy });
       checker.start();
       await vi.advanceTimersByTimeAsync(20 * 1000);
-      expect(execFile).not.toHaveBeenCalledWith(
-        'cortextos',
-        expect.arrayContaining([expect.stringContaining('[watchdog]')]),
-        expect.any(Function),
-      );
+      expect(watchdogLogs(logSpy).length).toBe(0);
       checker.stop();
       checker.wake();
     });

@@ -74,7 +74,7 @@ export function logEvent(
  * or when any step fails — event writes are the authoritative record
  * and must never be blocked by heartbeat housekeeping.
  */
-function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string): void {
+export function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string): void {
   try {
     const hbPath = join(paths.stateDir, 'heartbeat.json');
     if (!existsSync(hbPath)) return;

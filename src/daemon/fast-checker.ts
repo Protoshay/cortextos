@@ -1,10 +1,10 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
-import { execFile } from 'child_process';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
+import { refreshHeartbeatTimestamp } from '../bus/event.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
@@ -106,14 +106,23 @@ export class FastChecker {
     await this.waitForBootstrap();
     this.log('Bootstrap complete. Beginning poll loop.');
 
-    // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state
+    // Idle-session heartbeat watchdog: fires every 50 min regardless of REPL state.
+    // Bumps ONLY last_heartbeat on THIS agent's own heartbeat.json via its resolved
+    // paths (this.paths). Two bugs this replaces a shell-out for:
+    //   1) Cross-write: the old `execFile('cortextos', ['bus','update-heartbeat',...])`
+    //      inherited the single daemon process's ambient CTX_AGENT_NAME (all 11
+    //      FastCheckers run in-process in one daemon), so every watchdog stamp landed
+    //      on ONE shared file instead of the per-agent target.
+    //   2) Status-clobber: update-heartbeat overwrote the agent's meaningful status
+    //      line every 50min. refreshHeartbeatTimestamp bumps last_heartbeat ONLY and
+    //      preserves every other field. The "[watchdog] X alive" line goes to the
+    //      fast-checker log, not the status field.
     const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;
     const agentName = this.agent.name;
     this.heartbeatTimer = setInterval(() => {
       const ts = new Date().toISOString();
-      execFile('cortextos', ['bus', 'update-heartbeat', `[watchdog] ${agentName} alive — idle session ${ts}`], (err) => {
-        if (err) this.log(`Heartbeat watchdog error: ${err.message}`);
-      });
+      refreshHeartbeatTimestamp(this.paths, ts);
+      this.log(`[watchdog] ${agentName} alive — idle session ${ts}`);
     }, HEARTBEAT_INTERVAL_MS);
 
     while (this.running) {
