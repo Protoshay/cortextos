@@ -8,12 +8,15 @@ import { FastChecker } from '../../../src/daemon/fast-checker';
 import type { BusPaths, TelegramCallbackQuery } from '../../../src/types';
 
 // Minimal mock for AgentProcess
-function createMockAgent(name = 'test-agent') {
+function createMockAgent(name = 'test-agent', recentOutput = '') {
   return {
     name,
     isBootstrapped: vi.fn().mockReturnValue(true),
     injectMessage: vi.fn().mockReturnValue(true),
     write: vi.fn(),
+    getOutputBuffer: vi.fn().mockReturnValue({
+      getRecent: vi.fn().mockReturnValue(recentOutput),
+    }),
   } as any;
 }
 
@@ -912,6 +915,60 @@ describe('FastChecker', () => {
       expect(agent.injectMessage).toHaveBeenCalledTimes(1);
       const injected = agent.injectMessage.mock.calls[0][0] as string;
       expect(injected).toContain('````');
+    });
+  });
+
+  describe('idle-session watchdog stamp (status-aware)', () => {
+    // Authentic client-limit phrase captured from a live stdout.log.
+    const CLIENT_LINE = 'Context limit reached \u00B7 /compact or /clear to continue';
+
+    function writeHeartbeat(status: string): void {
+      const hb = {
+        agent: 'test-agent',
+        org: 'test-org',
+        status,
+        current_task: 'some/task',
+        mode: 'day',
+        last_heartbeat: '2026-04-23T12:00:00Z',
+        loop_interval: '4h',
+      };
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(hb));
+    }
+
+    it('wedged session: flips status to context-limit-wedged and logs the wedged line', () => {
+      writeHeartbeat('online');
+      const logs: string[] = [];
+      const agent = createMockAgent('test-agent', 'chatter\n' + CLIENT_LINE);
+      const checker = new FastChecker(agent, paths, '/tmp/framework', {
+        log: (m) => logs.push(m),
+      });
+
+      const ts = new Date().toISOString();
+      (checker as any).runWatchdogStamp(ts);
+
+      const hb = JSON.parse(readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8'));
+      expect(hb.status).toBe('context-limit-wedged');
+      expect(hb.last_heartbeat).toBe(ts);
+      expect(logs.some((l) => /context-limit-wedged — not stamping healthy/.test(l))).toBe(true);
+      expect(logs.some((l) => /alive — idle session/.test(l))).toBe(false);
+    });
+
+    it('healthy session: leaves status untouched and logs the alive line', () => {
+      writeHeartbeat('Live session — closing a deal');
+      const logs: string[] = [];
+      const agent = createMockAgent('test-agent', 'ordinary output\nContext is at 72%');
+      const checker = new FastChecker(agent, paths, '/tmp/framework', {
+        log: (m) => logs.push(m),
+      });
+
+      const ts = new Date().toISOString();
+      (checker as any).runWatchdogStamp(ts);
+
+      const hb = JSON.parse(readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8'));
+      expect(hb.status).toBe('Live session — closing a deal');
+      expect(hb.last_heartbeat).toBe(ts);
+      expect(logs.some((l) => /alive — idle session/.test(l))).toBe(true);
+      expect(logs.some((l) => /context-limit-wedged/.test(l))).toBe(false);
     });
   });
 });

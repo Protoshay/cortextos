@@ -13,6 +13,32 @@ import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../ut
 
 type LogFn = (msg: string) => void;
 
+// Context-wedge detection. Two arms:
+//   API_OVERFLOW_RE  — Anthropic API-side overflow messages, scanned over the
+//                      FULL output buffer (they appear inline mid-stream).
+//   CLIENT_LIMIT_RE  — the client-side "Context limit reached … /compact or
+//                      /clear to continue" prompt Claude Code renders when a
+//                      PTY session hits its context limit. It is redrawn sticky
+//                      at the buffer END, so it is matched over the TAIL only —
+//                      ordinary discussion of the phrase scrolls away, and
+//                      tail-only scanning prevents false positives from rollout
+//                      chatter. The [\s\S]{0,10}? tolerates the U+00B7 middle-dot
+//                      separator plus its surrounding spaces between the anchors.
+const API_OVERFLOW_RE = /extra usage.*?1[Mm] context|conversation too long.*?compaction/i;
+const CLIENT_LIMIT_RE = /Context limit reached[\s\S]{0,10}?\/compact or \/clear to continue/i;
+const CLIENT_TAIL_CHARS = 1500;
+
+/**
+ * True when the recent PTY output indicates the session is context-wedged —
+ * either an API-side overflow error (anywhere in the buffer) or the client-side
+ * context-limit prompt (in the buffer tail only). The tail slice happens INSIDE
+ * this function; call sites pass the full recent buffer.
+ */
+export function isContextWedged(recentOutput: string): boolean {
+  if (API_OVERFLOW_RE.test(recentOutput)) return true;
+  return CLIENT_LIMIT_RE.test(recentOutput.slice(-CLIENT_TAIL_CHARS));
+}
+
 /**
  * Fast message checker for a single agent.
  * Replaces fast-checker.sh: polls Telegram and inbox, injects into PTY.
@@ -118,11 +144,8 @@ export class FastChecker {
     //      preserves every other field. The "[watchdog] X alive" line goes to the
     //      fast-checker log, not the status field.
     const HEARTBEAT_INTERVAL_MS = 50 * 60 * 1000;
-    const agentName = this.agent.name;
     this.heartbeatTimer = setInterval(() => {
-      const ts = new Date().toISOString();
-      refreshHeartbeatTimestamp(this.paths, ts);
-      this.log(`[watchdog] ${agentName} alive — idle session ${ts}`);
+      this.runWatchdogStamp(new Date().toISOString());
     }, HEARTBEAT_INTERVAL_MS);
 
     while (this.running) {
@@ -139,6 +162,26 @@ export class FastChecker {
     if (process.platform !== 'win32') {
       process.removeListener('SIGUSR1', sigusr1Handler);
     }
+  }
+
+  /**
+   * Idle-session watchdog stamp. Status-aware: before stamping healthy, scan the
+   * recent PTY output for a context wedge. A wedged session can no longer process
+   * injected prompts, so stamping it "alive" would keep the dashboard GREEN on a
+   * dead agent. When wedged we stamp with an explicit `context-limit-wedged`
+   * status (and log accordingly) instead of the healthy alive line. Layer 1
+   * (checkContextStatus) drives recovery; the watchdog only stops lying.
+   */
+  private runWatchdogStamp(ts: string): void {
+    const agentName = this.agent.name;
+    const recentOutput = this.agent.getOutputBuffer()?.getRecent(8000) ?? '';
+    if (isContextWedged(recentOutput)) {
+      refreshHeartbeatTimestamp(this.paths, ts, 'context-limit-wedged');
+      this.log(`[watchdog] ${agentName} context-limit-wedged — not stamping healthy ${ts}`);
+      return;
+    }
+    refreshHeartbeatTimestamp(this.paths, ts);
+    this.log(`[watchdog] ${agentName} alive — idle session ${ts}`);
   }
 
   /**
@@ -983,9 +1026,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     // Check PTY output for hard API overflow errors (always act regardless of threshold config)
     const recentOutput = this.agent.getOutputBuffer()?.getRecent(8000) ?? '';
-    if (/extra usage.*?1[Mm] context|conversation too long.*?compaction/i.test(recentOutput)) {
-      this.log('Context overflow error detected in PTY output — force restarting');
-      this.forceContextRestart('API overflow error in PTY output');
+    if (isContextWedged(recentOutput)) {
+      this.log('Context wedge detected in PTY output (API overflow or client-side context-limit prompt) — force restarting');
+      this.forceContextRestart('context wedge in PTY output (API overflow or client-side context-limit prompt)');
       return;
     }
 

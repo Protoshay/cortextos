@@ -174,5 +174,52 @@ describe('Bus events', () => {
       expect(() => refreshHeartbeatTimestamp(paths, new Date().toISOString())).not.toThrow();
       expect(existsSync(join(paths.stateDir, 'heartbeat.json'))).toBe(false);
     });
+
+    // Optional status param: the watchdog stamps `context-limit-wedged` when a
+    // session is context-wedged so the dashboard stops showing it healthy.
+    it('sets hb.status when the optional status param is provided', () => {
+      const before: Heartbeat = {
+        agent: 'spark',
+        org: 'eros-os',
+        status: 'online',
+        current_task: 'deal/rosie-ingram',
+        mode: 'day',
+        last_heartbeat: '2026-04-23T12:00:00Z',
+        loop_interval: '4h',
+      };
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(before));
+
+      const ts = new Date().toISOString();
+      refreshHeartbeatTimestamp(paths, ts, 'context-limit-wedged');
+
+      const after = JSON.parse(
+        readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8'),
+      ) as Heartbeat;
+      expect(after.status).toBe('context-limit-wedged');
+      expect(after.last_heartbeat).toBe(ts);
+      // Other fields untouched.
+      expect(after.current_task).toBe('deal/rosie-ingram');
+      expect(after.mode).toBe('day');
+    });
+
+    it('leaves hb.status untouched when the status param is omitted', () => {
+      const before: Heartbeat = {
+        agent: 'spark',
+        org: 'eros-os',
+        status: 'Live session — closing Rosie Ingram deal',
+        current_task: 'deal/rosie-ingram',
+        mode: 'day',
+        last_heartbeat: '2026-04-23T12:00:00Z',
+        loop_interval: '4h',
+      };
+      writeFileSync(join(paths.stateDir, 'heartbeat.json'), JSON.stringify(before));
+
+      refreshHeartbeatTimestamp(paths, new Date().toISOString());
+
+      const after = JSON.parse(
+        readFileSync(join(paths.stateDir, 'heartbeat.json'), 'utf-8'),
+      ) as Heartbeat;
+      expect(after.status).toBe('Live session — closing Rosie Ingram deal');
+    });
   });
 });

@@ -73,13 +73,19 @@ export function logEvent(
  * preserving every other field. No-op when the file does not exist yet
  * or when any step fails — event writes are the authoritative record
  * and must never be blocked by heartbeat housekeeping.
+ *
+ * When `status` is provided it is also written to `hb.status` (used by the
+ * idle-session watchdog to flag a context-wedged session so the dashboard
+ * stops showing it healthy). When omitted the status field is left untouched,
+ * so every existing call site behaves exactly as before.
  */
-export function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string): void {
+export function refreshHeartbeatTimestamp(paths: BusPaths, timestamp: string, status?: string): void {
   try {
     const hbPath = join(paths.stateDir, 'heartbeat.json');
     if (!existsSync(hbPath)) return;
     const hb = JSON.parse(readFileSync(hbPath, 'utf-8')) as Heartbeat;
     hb.last_heartbeat = timestamp;
+    if (status !== undefined) hb.status = status;
     atomicWriteSync(hbPath, JSON.stringify(hb));
   } catch {
     // Best-effort — event already persisted, heartbeat refresh is secondary.
