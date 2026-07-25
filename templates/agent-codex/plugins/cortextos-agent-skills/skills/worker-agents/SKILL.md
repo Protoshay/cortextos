@@ -131,3 +131,40 @@ cortextos bus log-event action worker_completed info \
 - NEVER let workers modify files you or other agents are editing
 - ALWAYS log spawns and completions
 - Workers should NOT spawn their own workers (no worker-ception)
+
+---
+
+
+## Isolation Safety — MANDATORY (added 2026-07-24 after a main-contamination near-miss)
+
+**Incident:** a code worker launched with `Agent(isolation:"worktree")` did NOT get an isolated worktree, ran in the real `/root/cortextos` checkout, committed onto `main`, and its `npm run build` overwrote the live `dist/`. Caught after the fact. (See MISTAKES_LOG 2026-07-24.) **Never trust that isolation held — verify it, structurally, at both ends.**
+
+### Rule 1 — Worker self-asserts its location (put this in EVERY code-worker brief)
+The worker's FIRST commands must be:
+```bash
+pwd
+git rev-parse --show-toplevel
+git rev-parse --abbrev-ref HEAD
+```
+Then assert the toplevel is an **isolated worktree**, not the main checkout: the path must contain `.claude/worktrees/agent-`, or the branch must match `worktree-agent-*`. If it resolves to the main repo root (`/root/cortextos`) or the branch is `main`, the worker must **STOP and report — do NOT commit, do NOT run `npm run build`.**
+
+### Rule 2 — Parent diffs the main tip before/after EVERY code-worker run (make the catch structural)
+Before launching any code worker, record the target repo's main tip:
+```bash
+git -C /root/cortextos rev-parse main   # record BASE (e.g. 743cb66)
+```
+After the worker completes, re-check BOTH:
+```bash
+git -C /root/cortextos rev-parse main     # must equal BASE
+git -C /root/cortextos worktree list      # worker must be on worktree-agent-*, NOT main
+```
+Also confirm the completion notification carried a `<worktree>` tag / `worktreePath` — its **absence** signals isolation did NOT provision. If `main` advanced, or `dist/daemon.js` mtime changed, without authorization → the worker contaminated shared state.
+
+### Recovery if contaminated
+1. `git branch <preserve-name> <worker-commit>` FIRST — additive/safe, preserves the work.
+2. Flag skiffy with the blast radius (main tip, dist state, whether the running daemon is affected).
+3. Only on skiffy's **explicit** go: `git reset --hard <base>` + `npm run build` to restore the gated dist. Reset (not revert) so a nightly merge isn't poisoned by a revert/re-apply tangle — but `reset --hard` on shared main is destructive and requires skiffy's explicit authorization **every time**.
+4. Verify after: main tip = base; `grep -c` new symbols in `dist/daemon.js` = 0; `sanitizeForPtyInjection` still present in dist (canonical-branch discipline); preserved branch still at the worker commit.
+
+### Why this matters
+`scout`'s cwd lives inside the main repo, so any worker that does NOT get an isolated worktree defaults to operating on live main + dist. On the next daemon restart that ungated dist would load unreviewed — defeating the entire gate-review process, which depends on code changes staying on a branch until skiffy gates them.
