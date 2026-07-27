@@ -163,6 +163,12 @@ jq --arg focus "user's stated focus" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 
 ### 1D: Cascade goals to each active agent
 
+**Enumerate the roster from the live source — never from memory or context:**
+```bash
+cortextos bus list-agents
+```
+Every enabled agent gets a refresh. Working from the agents you happen to have in context produces partial cascades (2026-07-25: rocky, rimu, scribe, analyst were missed because only in-context agents were cascaded — rocky had to flag his own stale GOALS.md).
+
 For each agent in the roster:
 1. Determine 2-5 role-appropriate goals based on their function and today's focus
 2. Write their `goals.json`:
@@ -187,6 +193,12 @@ For each agent in the roster:
    ```
 
 If an agent's `goals.json` already has `daily_focus_set_at` matching today: skip — don't overwrite.
+
+**Completeness check (mandatory, after the loop):** every enabled agent's `goals.json` must carry today's `updated_at`:
+```bash
+for a in $(ls $CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/); do python3 -c "import json;d=json.load(open('$CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/$a/goals.json'));print('$a',d['updated_at'])" 2>/dev/null; done
+```
+Any agent showing a stale date = the cascade is not done.
 
 ### 1E: Set your own goals
 
