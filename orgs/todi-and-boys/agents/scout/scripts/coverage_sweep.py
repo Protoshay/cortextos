@@ -363,6 +363,17 @@ def build_matrix(roster, procs, sample_seconds, inject):
 
     for agent, m in matrix.items():
         if "verdict" in m:
+            # Early-verdict agents (e.g. DOWN: no live process) still need a
+            # coverage value. Leaving it blank would render them identically to
+            # an agent that passed -- the exact defect this axis exists to close.
+            if "coverage" not in m:
+                cells0 = m.get("cells") or {}
+                miss0 = [s for s in SIGNALS
+                         if s not in cells0 or cells0[s].state != APPLIED]
+                m["coverage"] = "UNCOVERABLE" if len(miss0) == len(SIGNALS) else "PARTIAL"
+                m["coverage_why"] = "; ".join(
+                    f"{s}: {cells0[s].reason}" for s in miss0 if s in cells0
+                ) or f"verdict {m['verdict']} assigned before any signal applied"
             continue
         cells = m["cells"]
         applied = [s for s in SIGNALS if cells[s].state == APPLIED]
@@ -385,6 +396,24 @@ def build_matrix(roster, procs, sample_seconds, inject):
         m["verdict"] = verdict
         m["applied"] = applied
         m["fired"] = fired
+
+        # COVERAGE IS A SEPARATE AXIS FROM HEALTH (skiffy ruling, 2026-07-27, from
+        # cycle 6 on). The health verdict answers "is this agent wedged?". Coverage
+        # answers "could I have told?". They are independent, and collapsing them is
+        # the otis defect: an agent whose signals are structurally unavailable was
+        # rendering the same as one that actively passed. Appearing monitored is
+        # WORSE than appearing unmonitored, because nobody goes looking.
+        missing = [s for s in SIGNALS if cells[s].state != APPLIED]
+        if not missing:
+            coverage, why = "COVERED", ""
+        elif len(applied) == 0:
+            coverage = "UNCOVERABLE"
+            why = "; ".join(f"{s}: {cells[s].reason}" for s in missing)
+        else:
+            coverage = "PARTIAL"
+            why = "; ".join(f"{s}: {cells[s].reason}" for s in missing)
+        m["coverage"] = coverage
+        m["coverage_why"] = why
     return matrix
 
 
@@ -441,6 +470,26 @@ def report(matrix):
                      f"NOT bugs, NOT measurements: lower bounds only, never averaged in.")
         for c in censored:
             lines.append(f"      {c}")
+    # COVERAGE AXIS -- reported SEPARATELY from the health verdict, and printed
+    # before it, because "could I have told?" has to be answered before "was it
+    # fine?" means anything. An UNCOVERABLE or PARTIAL agent must never read the
+    # same as one that actively passed.
+    lines.append("")
+    lines.append("COVERAGE AXIS (independent of health verdict):")
+    for agent, m in matrix.items():
+        cov = m.get("coverage", "?")
+        if cov == "COVERED":
+            lines.append(f"      {agent.ljust(w)}  COVERED      all {len(SIGNALS)} signals applied")
+        else:
+            lines.append(f"      {agent.ljust(w)}  {cov.ljust(12)} {m.get('coverage_why','')}")
+    part = [a for a, m in matrix.items() if m.get("coverage") == "PARTIAL"]
+    unc = [a for a, m in matrix.items() if m.get("coverage") == "UNCOVERABLE"]
+    if part or unc:
+        lines.append(f"      -> PARTIAL: {', '.join(part) if part else 'none'}"
+                     f" | UNCOVERABLE: {', '.join(unc) if unc else 'none'}")
+        lines.append("      -> A non-COVERED agent's 'healthy' is an artefact of the "
+                     "arithmetic, not a finding.")
+    lines.append("")
     lines.append(f"UNDER-INSTRUMENTED: {', '.join(under) if under else 'none'}")
     lines.append(f"SUSPECT (2 signals, investigate buffer -- do NOT restart): "
                  f"{', '.join(suspect) if suspect else 'none'}")
