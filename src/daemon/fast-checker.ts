@@ -1032,6 +1032,18 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       return;
     }
 
+    // CLASS EXCLUSION: codex-backed runtimes do not expose a context OCCUPANCY signal.
+    // codex-app-server's thread/tokenUsage total is a CUMULATIVE token counter over the
+    // thread's lifetime, not the size of the current window, so used_percentage derived
+    // from it climbs past the window and never returns (otis, 2026-07-27: 5.1M tokens
+    // against a 258,400 window, one session_id, while the agent was completing work).
+    // exceeds_200k_tokens is derived from the same counter and is equally meaningless here,
+    // so the fallback below would fire even with used_percentage absent. Acting on either
+    // would put a healthy codex agent into a permanent handoff/force-restart loop.
+    // Excluded by CLASS, not by agent name: a named exception has to be re-justified by
+    // every future reader and the next codex agent would inherit the trap silently.
+    if (this.agent.getConfig().runtime === 'codex-app-server') return;
+
     const { warn, handoff } = this.getCtxThresholds();
 
     // No threshold configured — observe-only mode (log but don't act)

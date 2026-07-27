@@ -801,7 +801,8 @@ export class CodexAppServerPTY {
       ? tokenUsage.modelContextWindow
       : null;
     const cap = modelContextWindow ?? this._config.codex_context_cap ?? 256000;
-    const usedPct = cap > 0 ? Math.min(100, (totalTokens / cap) * 100) : null;
+    const usedPctRaw = cap > 0 ? (totalTokens / cap) * 100 : null;
+    const usedPct = usedPctRaw === null ? null : Math.min(100, usedPctRaw);
 
     const inputTokens = typeof total.inputTokens === 'number' ? total.inputTokens : 0;
     const outputTokens = typeof total.outputTokens === 'number' ? total.outputTokens : 0;
@@ -809,7 +810,14 @@ export class CodexAppServerPTY {
 
     const payload = JSON.stringify({
       used_percentage: usedPct,
+      // Pre-clamp value, kept so the reading stays auditable. The clamp above turns an
+      // out-of-range number into a plausible one (otis 2026-07-27: a true 1870% presented
+      // as a flat 100%), which destroys the evidence that the value is junk while leaving
+      // the value in place. Anything > 100 here means totalTokens is being read as
+      // occupancy when codex reports it cumulatively — never treat it as a capacity gauge.
+      used_percentage_raw: usedPctRaw,
       context_window_size: cap,
+      total_tokens_cumulative: totalTokens,
       exceeds_200k_tokens: totalTokens > 200000,
       current_usage: {
         input_tokens: inputTokens,

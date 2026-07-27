@@ -971,4 +971,81 @@ describe('FastChecker', () => {
       expect(logs.some((l) => /context-limit-wedged/.test(l))).toBe(false);
     });
   });
+
+/**
+ * CODEX RUNTIME CLASS EXCLUSION on the context handoff gate.
+ *
+ * codex-app-server reports a CUMULATIVE token counter, not window occupancy, so a
+ * derived used_percentage pins at 100 within minutes of boot and never returns
+ * (otis, 2026-07-27: 5.1M tokens against a 258,400 window, one session_id, while
+ * the agent was completing work). Acting on it would put a healthy codex agent in a
+ * permanent handoff/force-restart loop.
+ *
+ * Deliberately asserted in BOTH directions in the same suite: a guard tested only on
+ * the case it is meant to block cannot distinguish "the guard works" from "the gate
+ * never fires here anyway". The claude case is the positive control.
+ */
+describe('context handoff gate — codex runtime class exclusion', () => {
+  function writeStatus(stateDir: string, pct: number, exceeds: boolean): void {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, 'context_status.json'),
+      JSON.stringify({
+        used_percentage: pct,
+        exceeds_200k_tokens: exceeds,
+        session_id: 'sess-1',
+        written_at: new Date().toISOString(),
+      }),
+      'utf-8',
+    );
+  }
+
+  function agentWithRuntime(runtime: string | undefined, agentDir: string) {
+    const agent = createMockAgent('gate-test', 'ordinary output with nothing alarming in it');
+    agent.getConfig = vi.fn().mockReturnValue({ runtime, ctx_handoff_threshold: 80 });
+    agent.getAgentDir = vi.fn().mockReturnValue(agentDir);
+    return agent;
+  }
+
+  it('codex-app-server at 100% + exceeds_200k: does NOT inject a handoff prompt', async () => {
+    writeStatus(paths.stateDir, 100, true);
+    const agentDir = join(testDir, 'agent-codex');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'config.json'), JSON.stringify({ ctx_handoff_threshold: 80 }));
+
+    const agent = agentWithRuntime('codex-app-server', agentDir);
+    const checker = new FastChecker(agent, paths, '/tmp/framework');
+    await (checker as any).checkContextStatus();
+
+    expect(agent.injectMessage).not.toHaveBeenCalled();
+  });
+
+  it('POSITIVE CONTROL — claude-code at 100% on the same input DOES inject a handoff prompt', async () => {
+    writeStatus(paths.stateDir, 100, true);
+    const agentDir = join(testDir, 'agent-claude');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'config.json'), JSON.stringify({ ctx_handoff_threshold: 80 }));
+
+    const agent = agentWithRuntime('claude-code', agentDir);
+    const checker = new FastChecker(agent, paths, '/tmp/framework');
+    await (checker as any).checkContextStatus();
+
+    const injected = (agent.injectMessage as any).mock.calls.map((c: any[]) => String(c[0])).join('\n');
+    expect(injected).toMatch(/CONTEXT HANDOFF REQUIRED/);
+  });
+
+  it('undefined runtime (legacy claude agents) is NOT excluded', async () => {
+    writeStatus(paths.stateDir, 100, true);
+    const agentDir = join(testDir, 'agent-legacy');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'config.json'), JSON.stringify({ ctx_handoff_threshold: 80 }));
+
+    const agent = agentWithRuntime(undefined, agentDir);
+    const checker = new FastChecker(agent, paths, '/tmp/framework');
+    await (checker as any).checkContextStatus();
+
+    const injected = (agent.injectMessage as any).mock.calls.map((c: any[]) => String(c[0])).join('\n');
+    expect(injected).toMatch(/CONTEXT HANDOFF REQUIRED/);
+  });
+});
 });
