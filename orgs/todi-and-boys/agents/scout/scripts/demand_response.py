@@ -147,7 +147,15 @@ def newest_response(agent, inject=None):
                     e = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                # EXCLUDE the counterfeit writer (human via iOS mobile-reply).
+                # EXCLUDE the counterfeit writer -- DO NOT REMOVE THIS GUARD.
+                # cli/bus.ts:1680 (`mobile-reply`) writes this log under the
+                # AGENT's name when a HUMAN answers from the iOS app. So a
+                # WEDGED agent whose human replies from their phone stamps its
+                # own liveness: the human forges the very signal that would
+                # have exposed the wedge. A liveness signal a third party can
+                # emit on the agent's behalf is not a liveness signal at all.
+                # Only the "mobile-reply-*" message_id distinguishes them --
+                # nothing else in the record does.
                 if str(e.get("message_id", "")).startswith("mobile-reply-"):
                     continue
                 t = e.get("timestamp")
