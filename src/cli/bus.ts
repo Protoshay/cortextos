@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -180,21 +180,41 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled). Omit to keep current status while updating --desc.')
   .option('--desc <text>', 'Update task description')
-  .action((id: string, status: string, opts: { desc?: string }) => {
+  .action((id: string, status: string | undefined, opts: { desc?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
-    if (!validStatuses.includes(status as TaskStatus)) {
-      console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
-      process.exit(1);
-    }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+
+    let resolvedStatus: TaskStatus;
+    if (status === undefined) {
+      // Desc-only update: status wasn't a real optional argument before, so
+      // `update-task <id> --desc "..."` errored on a missing positional arg
+      // even though the caller had no intent to change status. Look up the
+      // task's current status and pass it straight through unchanged.
+      if (!opts.desc) {
+        console.error('Nothing to update: provide a status, --desc, or both.');
+        process.exit(1);
+      }
+      const filePath = findTaskFile(paths, id);
+      if (!filePath) {
+        console.error(`Task ${id} not found in any org under ${paths.ctxRoot}/orgs/`);
+        process.exit(1);
+      }
+      resolvedStatus = (JSON.parse(readFileSync(filePath, 'utf-8')) as Task).status;
+    } else {
+      if (!validStatuses.includes(status as TaskStatus)) {
+        console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+        process.exit(1);
+      }
+      resolvedStatus = status as TaskStatus;
+    }
 
     // Guard: block review/completion when deliverables are required but missing.
     // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
     // so the validator works regardless of which status set is installed.
-    if ((status === 'ready_for_review' || status === 'completed') && env.org) {
+    if ((resolvedStatus === 'ready_for_review' || resolvedStatus === 'completed') && env.org) {
       const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
       if (err) {
         console.error(err);
@@ -202,8 +222,8 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus, opts.desc);
-    console.log(`Updated ${id} -> ${status}`);
+    updateTask(paths, id, resolvedStatus, opts.desc);
+    console.log(`Updated ${id} -> ${resolvedStatus}`);
   });
 
 busCommand
