@@ -24,6 +24,29 @@ type LogFn = (msg: string) => void;
 const MAX_REQUEUE_WINDOW_MS = 12 * 60 * 60 * 1000; // 12h
 
 /**
+ * Maximum age of a `.handoff-doc-path` MARKER at consume time.
+ *
+ * This bounds the restart ROUND-TRIP: marker write -> daemon stop -> process
+ * exit -> fresh start -> buildStartupPrompt(). It is deliberately NOT the
+ * 15-minute window in fast-checker.ts. That one is doc-SELECTION slack, applied
+ * to candidate handoff FILES; this one is applied to the MARKER. Same units,
+ * different objects, different reasons — do not merge them into one constant.
+ *
+ * Chosen from measurement, not feel: an observed Tier-3 handoff restart
+ * (2026-07-27) took 17.2s end-to-end from doc write to prompt build. 5 minutes
+ * leaves ~17x headroom while still rejecting the hazard this guards — a marker
+ * stranded by a `--continue` boot (which never consumes it) or by
+ * `bus hard-restart` running while the daemon is down (which writes the marker,
+ * prints success and exits 0). Those strand for hours, not seconds.
+ *
+ * CAUTION: config.startup_delay is awaited inside this budget (see start()),
+ * so this value must stay comfortably above the largest configured
+ * startup_delay or handoffs will be dropped for that agent. It is 0 for all
+ * agents as of 2026-07-27.
+ */
+const HANDOFF_MARKER_MAX_AGE_MS = 5 * 60 * 1000; // 5min
+
+/**
  * Manages a single agent's lifecycle.
  * Replaces agent-wrapper.sh for one agent.
  */
@@ -627,7 +650,24 @@ export class AgentProcess {
     try {
       const { unlinkSync } = require('fs');
       const docPath = readFileSync(markerPath, 'utf-8').trim();
+      // stat BEFORE unlink — the marker's own mtime is the only record of when
+      // the restart that wrote it was planned.
+      const ageMs = Date.now() - statSync(markerPath).mtimeMs;
       unlinkSync(markerPath);
+      if (ageMs > HANDOFF_MARKER_MAX_AGE_MS) {
+        // Unlink regardless (done above): the marker is the ONLY thing that makes
+        // a stale doc reachable, so leaving it preserves exactly the strand this
+        // guard exists to kill. Log loudly — a silent discard would be worse than
+        // the bug, because it deletes the evidence it was discarding. The age is
+        // logged so a 20-minute strand is distinguishable from a 12-hour one
+        // without re-running anything.
+        this.log(
+          `Handoff marker STALE — planned ${Math.round(ageMs / 1000)}s ago ` +
+          `(limit ${Math.round(HANDOFF_MARKER_MAX_AGE_MS / 1000)}s), doc was ` +
+          `${docPath || '(empty)'}. Marker discarded; booting WITHOUT handoff context.`
+        );
+        return '';
+      }
       if (!docPath || !existsSync(docPath)) return '';
       return ` CONTEXT HANDOFF: Before restoring crons or checking inbox, read the handoff document at ${docPath} to resume your prior session state.`;
     } catch {
