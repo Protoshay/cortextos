@@ -148,8 +148,9 @@ export function clearHumanQuestion(
 ): void {
   try {
     unlinkSync(openQuestionPath(ctxRoot, agentName, chatId));
-  } catch {
-    // Missing state is the normal case.
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw err;
   }
 }
 

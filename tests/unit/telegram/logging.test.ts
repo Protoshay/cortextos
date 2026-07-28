@@ -12,6 +12,7 @@ import {
   checkHumanConversationGate,
   containsBehaviourPromise,
   markHumanQuestionOpen,
+  clearHumanQuestion,
   countHumanQuestions,
 } from '../../../src/telegram/logging';
 import { TelegramAPI } from '../../../src/telegram/api';
@@ -202,6 +203,28 @@ describe('Telegram Logging', () => {
       recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg);
 
       expect(checkHumanQuestionGate(testDir, 'spark', '100', 'Another?')).toBeNull();
+    });
+  });
+
+  describe('clearHumanQuestion', () => {
+    it('treats only a missing marker as benign', () => {
+      expect(() => clearHumanQuestion(testDir, 'bot1', '999')).not.toThrow();
+    });
+
+    it('removes an existing open-question marker', () => {
+      markHumanQuestionOpen(testDir, 'bot1', '999', 'Continue?', 17);
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Another?')).toContain('still unanswered');
+
+      clearHumanQuestion(testDir, 'bot1', '999');
+
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Another?')).toBeNull();
+    });
+
+    it('surfaces non-ENOENT filesystem failures', () => {
+      const markerPath = join(testDir, 'state', 'bot1', '.telegram-open-question-999.json');
+      mkdirSync(markerPath, { recursive: true });
+
+      expect(() => clearHumanQuestion(testDir, 'bot1', '999')).toThrow();
     });
   });
 
