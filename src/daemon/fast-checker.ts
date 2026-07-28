@@ -79,6 +79,7 @@ export class FastChecker {
   private ctxWarningFiredAt: number = 0;    // dedup: 15min cooldown between warnings
   private ctxHandoffFiredAt: number = 0;    // fires once per session (0 = not yet)
   private ctxHandoffDeadlineAt: number = 0; // timestamp after which force-restart fires
+  private ctxHandoffZeroedAt: number = 0;   // written_at of Tier 2's own reset write (see Tier 3)
   private ctxLastSessionId: string | null = null; // detects new session → clears stale deadline
   private ctxCircuitRestarts: number[] = []; // timestamps of recent context-triggered restarts
   private ctxCircuitBrokenAt: number | null = null; // when circuit tripped (null = healthy)
@@ -1001,10 +1002,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     let pct: number | null = null;
     let exceeds200k = false;
+    let writtenAt = 0;
     try {
       const raw = readFileSync(statusPath, 'utf-8');
       const data = JSON.parse(raw);
-      const age = now - new Date(data.written_at || 0).getTime();
+      writtenAt = new Date(data.written_at || 0).getTime();
+      const age = now - writtenAt;
       if (age > 10 * 60_000) return; // stale file — skip
       pct = typeof data.used_percentage === 'number' ? data.used_percentage : null;
       exceeds200k = Boolean(data.exceeds_200k_tokens);
@@ -1018,6 +1021,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           this.ctxHandoffFiredAt = 0;
           this.ctxHandoffDeadlineAt = 0;
           this.ctxWarningFiredAt = 0;
+          this.ctxHandoffZeroedAt = 0;
           this.log(`New session detected (${incomingSessionId.slice(0, 8)}…) — per-session ctx state reset`);
         }
         this.ctxLastSessionId = incomingSessionId;
@@ -1054,6 +1058,35 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
 
     // Tier 3: deadline exceeded — force restart if agent ignored handoff prompt
     if (this.ctxHandoffDeadlineAt > 0 && now > this.ctxHandoffDeadlineAt) {
+      // An agent can relieve context pressure WITHOUT restarting, by compacting in place.
+      // Compaction preserves session_id, so the new-session reset above never fires, and the
+      // deadline then kills a session that has already solved the problem. Observed on scout
+      // 2026-07-28: forced restarts logged at "ctx 35%" and "ctx 32%" against an 80% threshold.
+      // The deadline only tells us the agent did not RESTART — not that context is still full.
+      //
+      // Trusting the reading requires care, because Tier 2 zeroes this same file when it fires
+      // (so the very next poll reads 0% and would look like a full recovery). Only a reading
+      // the context hook wrote AFTER that reset is genuine evidence, hence the writtenAt
+      // comparison rather than a bare `effectivePct < handoff`.
+      const recoveredReading = writtenAt > this.ctxHandoffZeroedAt && effectivePct < handoff;
+      if (recoveredReading) {
+        this.log(
+          `Handoff deadline passed but context recovered to ${Math.round(effectivePct)}% ` +
+          `(threshold ${handoff}%) — agent self-resolved in-session, standing down without restart`,
+        );
+        this.ctxHandoffDeadlineAt = 0;
+        this.ctxHandoffFiredAt = 0;
+        this.ctxWarningFiredAt = 0;
+        this.ctxHandoffZeroedAt = 0;
+        // Tier 2 pre-armed .force-fresh in case the agent never acted. It DID act, so clear the
+        // marker. shouldContinue() consumes it on the next restart of ANY kind, which would
+        // otherwise silently turn a routine restart into a history-discarding fresh boot.
+        try {
+          const forceFreshPath = join(this.paths.stateDir, '.force-fresh');
+          if (existsSync(forceFreshPath)) unlinkSync(forceFreshPath);
+        } catch { /* non-fatal */ }
+        return;
+      }
       this.log(`Handoff deadline exceeded (${Math.round(effectivePct)}%) — force restarting`);
       this.ctxHandoffDeadlineAt = 0;
       this.forceContextRestart(`ctx ${Math.round(effectivePct)}% — handoff not completed within 5min`);
@@ -1073,10 +1106,15 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     if (effectivePct >= handoff && this.ctxHandoffFiredAt === 0) {
       this.ctxHandoffFiredAt = now;
       this.ctxHandoffDeadlineAt = now + 5 * 60_000; // 5min grace for agent to cooperate
-      // Reset context_status.json so the new session doesn't re-trigger immediately
+      // Reset context_status.json so the new session doesn't re-trigger immediately.
+      // Record this write's own timestamp: Tier 3 uses it to distinguish THIS reset (0%,
+      // meaning "no reading yet") from a genuine post-handoff reading by the context hook.
+      // Without that distinction the zero here reads as a full recovery on the next poll.
       const statusPath = join(this.paths.stateDir, 'context_status.json');
+      const zeroedAt = new Date();
+      this.ctxHandoffZeroedAt = zeroedAt.getTime();
       try {
-        writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: new Date().toISOString() }));
+        writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: zeroedAt.toISOString() }));
       } catch { /* non-fatal */ }
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
@@ -1121,10 +1159,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     try {
       const handoffsDir = join(this.agent.getAgentDir(), 'memory', 'handoffs');
       if (existsSync(handoffsDir)) {
-        const cutoff = now - 15 * 60_000;
-        const recent = readdirSync(handoffsDir)
+        const windowMs = 15 * 60_000;
+        const cutoff = now - windowMs;
+        const candidates = readdirSync(handoffsDir)
           .filter(f => f.startsWith('handoff-') && f.endsWith('.md'))
-          .map(f => ({ f, mtime: statSync(join(handoffsDir, f)).mtimeMs }))
+          .map(f => ({ f, mtime: statSync(join(handoffsDir, f)).mtimeMs }));
+        const recent = candidates
           .filter(({ mtime }) => mtime >= cutoff)
           .sort((a, b) => b.mtime - a.mtime);
         if (recent.length > 0) {
@@ -1132,6 +1172,19 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           const markerPath = join(this.paths.stateDir, '.handoff-doc-path');
           writeFileSync(markerPath, docPath, 'utf-8');
           this.log(`Tier 3 restart: found recent handoff doc, writing marker → ${docPath}`);
+        } else if (candidates.length > 0) {
+          // Discriminating case: handoff docs EXIST but none is inside the freshness window.
+          // Without this branch the drop is silent — control flow simply walks past the `if`,
+          // no exception is thrown, and the success log above never runs. That makes
+          // "handoff silently discarded" indistinguishable from "no forced restart happened",
+          // which is why this could never be caught from the logs.
+          const newest = candidates.reduce((a, b) => (b.mtime > a.mtime ? b : a));
+          const ageMin = Math.round((now - newest.mtime) / 60_000);
+          this.log(
+            `Tier 3 restart: ${candidates.length} handoff doc(s) present but NONE within the ` +
+            `${Math.round(windowMs / 60_000)}min freshness window — newest is ${newest.f} ` +
+            `(${ageMin}min old). Proceeding WITHOUT handoff context; the new session will cold-boot.`
+          );
         }
       }
     } catch { /* non-fatal — proceed without handoff context */ }
@@ -1140,6 +1193,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffFiredAt = 0;
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
+    this.ctxHandoffZeroedAt = 0;
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)
     hardRestart(this.paths, this.agent.name, `CONTEXT-FORCE-RESTART: ${reason}`);
