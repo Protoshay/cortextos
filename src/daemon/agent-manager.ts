@@ -14,7 +14,7 @@ import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
-import { processMediaMessage } from '../telegram/media.js';
+import { classifyProcessedMediaType, processMediaMessage } from '../telegram/media.js';
 
 type LogFn = (msg: string) => void;
 
@@ -367,14 +367,30 @@ export class AgentManager {
             const toRel = (p: string | undefined) => p ? relative(launchDir, p) : '';
             const relImagePath = toRel(media.image_path);
             const relFilePath = toRel(media.file_path);
+            const mediaType = classifyProcessedMediaType(String(media.type));
 
             log(`[DEBUG] media.type=${media.type} image_path=${JSON.stringify(relImagePath)} file_path=${JSON.stringify(relFilePath)}`);
+            if (mediaType === 'UNKNOWN') {
+              const unknownPayload = `[UNKNOWN_MEDIA]\ncaption: ${media.text}\nstatus: UNKNOWN — attachment type was not recognised`;
+              const formatted = FastChecker.formatTelegramTextMessage(
+                from,
+                effectiveChatId,
+                unknownPayload,
+                this.frameworkRoot,
+              );
+              if (!checker.isDuplicate(formatted)) {
+                checker.queueTelegramMessage(formatted, String(effectiveChatId), unknownPayload);
+              }
+              log(`Unknown Telegram media type surfaced: ${String(media.type)}`);
+              return;
+            }
+
             let formatted: string;
-            if (media.type === 'photo') {
+            if (mediaType === 'photo') {
               formatted = FastChecker.formatTelegramPhotoMessage(from, effectiveChatId, media.text, relImagePath);
-            } else if (media.type === 'document') {
+            } else if (mediaType === 'document') {
               formatted = FastChecker.formatTelegramDocumentMessage(from, effectiveChatId, media.text, relFilePath, media.file_name!);
-            } else if (media.type === 'voice' || media.type === 'audio') {
+            } else if (mediaType === 'voice' || mediaType === 'audio') {
               formatted = FastChecker.formatTelegramVoiceMessage(from, effectiveChatId, relFilePath, media.duration, media.transcript);
             } else {
               // video or video_note
@@ -387,14 +403,14 @@ export class AgentManager {
             }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
             let burstPayload: string;
-            if (media.type === 'photo') {
+            if (mediaType === 'photo') {
               burstPayload = `[PHOTO]\ncaption: ${media.text}\nlocal_file: ${relImagePath}`;
-            } else if (media.type === 'document') {
+            } else if (mediaType === 'document') {
               burstPayload = `[DOCUMENT]\ncaption: ${media.text}\nfile_name: ${media.file_name || ''}\nlocal_file: ${relFilePath}`;
-            } else if (media.type === 'voice' || media.type === 'audio') {
-              burstPayload = `[${media.type.toUpperCase()}]\n${media.transcript ? `transcript: ${media.transcript}\n` : ''}duration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
+            } else if (mediaType === 'voice' || mediaType === 'audio') {
+              burstPayload = `[${mediaType.toUpperCase()}]\n${media.transcript ? `transcript: ${media.transcript}\n` : ''}duration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
             } else {
-              burstPayload = `[${media.type.toUpperCase()}]\ncaption: ${media.text}\nfile_name: ${media.file_name || ''}\nduration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
+              burstPayload = `[${mediaType.toUpperCase()}]\ncaption: ${media.text}\nfile_name: ${media.file_name || ''}\nduration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
             }
             checker.queueTelegramMessage(formatted, String(effectiveChatId), burstPayload);
           }).catch((err) => {

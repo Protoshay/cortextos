@@ -40,5 +40,5 @@ if failures:
     print("FAIL: " + "; ".join(failures))
     raise SystemExit(1)
 
-print(f"PASS: {words} words")
+print(f"MECHANICAL_PASS: {words} words; tone, relevance, accuracy, and behaviour remain unassessed")
 PY

@@ -23,6 +23,28 @@ export interface ProcessedMedia {
   transcript?: string;
 }
 
+export type ProcessedMediaType = ProcessedMedia['type'];
+
+/**
+ * Preserve an explicit UNKNOWN verdict for runtime values outside the
+ * compile-time media union. Telegram can add new attachment types before this
+ * process is rebuilt, so an unrecognised value must never fall into the nearest
+ * formatting branch.
+ */
+export function classifyProcessedMediaType(value: string): ProcessedMediaType | 'UNKNOWN' {
+  switch (value) {
+    case 'photo':
+    case 'document':
+    case 'audio':
+    case 'voice':
+    case 'video':
+    case 'video_note':
+      return value;
+    default:
+      return 'UNKNOWN';
+  }
+}
+
 /**
  * Sanitize a filename by stripping unsafe characters.
  * Keeps only a-zA-Z0-9._- and limits to 200 chars.

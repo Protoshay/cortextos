@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { sanitizeFilename, processMediaMessage } from '../../../src/telegram/media';
+import { classifyProcessedMediaType, sanitizeFilename, processMediaMessage } from '../../../src/telegram/media';
 import type { TelegramMessage } from '../../../src/types';
 
 // Mock TelegramAPI
@@ -51,6 +51,19 @@ describe('sanitizeFilename', () => {
 
   it('handles unicode characters', () => {
     expect(sanitizeFilename('файл.txt')).toBe('.txt');
+  });
+});
+
+describe('classifyProcessedMediaType', () => {
+  it.each(['photo', 'document', 'audio', 'voice', 'video', 'video_note'] as const)(
+    'preserves known type %s',
+    (type) => {
+      expect(classifyProcessedMediaType(type)).toBe(type);
+    },
+  );
+
+  it('surfaces an unrecognised runtime type as UNKNOWN', () => {
+    expect(classifyProcessedMediaType('animation')).toBe('UNKNOWN');
   });
 });
 
