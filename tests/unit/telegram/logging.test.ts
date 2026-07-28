@@ -10,6 +10,10 @@ import {
   readLastSent,
   checkHumanQuestionGate,
   checkHumanConversationGate,
+  hasOpenHumanCorrection,
+  clearHumanCorrection,
+  containsBehaviourPromise,
+  containsCorrectionCompletionClaim,
   markHumanQuestionOpen,
   countHumanQuestions,
 } from '../../../src/telegram/logging';
@@ -270,6 +274,46 @@ describe('Telegram Logging', () => {
         '8721344756',
         'The protection only checked direct instructions, so I accepted the relayed directive as authorised.',
       )).toContain('internal or formal language');
+    });
+
+    it.each([
+      'I’ll do better.',
+      'I will make sure this never happens again.',
+      'Going forward, I’ll be more careful.',
+      'That won’t happen again.',
+    ])('blocks empty behaviour promises: %s', (text) => {
+      expect(containsBehaviourPromise(text)).toBe(true);
+      expect(checkHumanConversationGate('123', text)).toContain('do not promise future behaviour');
+    });
+
+    it('allows a brief acknowledgement without a future promise', () => {
+      expect(checkHumanConversationGate('123', 'You’re right. Sorry.')).toBeNull();
+    });
+
+    it('blocks a completion claim while a correction is open and unproved', () => {
+      expect(containsCorrectionCompletionClaim('Fixed and tested.')).toBe(true);
+      expect(checkHumanConversationGate('123', 'Fixed and tested.', false, true, false))
+        .toContain('correction is still open');
+    });
+
+    it('allows a completion claim backed by a completed correction task', () => {
+      expect(checkHumanConversationGate('123', 'Fixed and tested.', false, true, true)).toBeNull();
+    });
+  });
+
+  describe('human correction state', () => {
+    it('finds a correction in the inbound log and clears it only with a task receipt', () => {
+      const logDir = join(testDir, 'logs', 'bot1');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'inbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        text: 'You said you fixed it and did it wrong again.',
+        timestamp: '2026-07-28T09:00:00Z',
+      }) + '\n');
+
+      expect(hasOpenHumanCorrection(testDir, 'bot1', '999')).toBe(true);
+      clearHumanCorrection(testDir, 'bot1', '999', 'task_123');
+      expect(hasOpenHumanCorrection(testDir, 'bot1', '999')).toBe(false);
     });
   });
 

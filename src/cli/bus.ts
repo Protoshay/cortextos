@@ -23,7 +23,7 @@ import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
-import { logOutboundMessage, cacheLastSent, checkHumanConversationGate, checkHumanQuestionGate, markHumanQuestionOpen } from '../telegram/logging.js';
+import { logOutboundMessage, cacheLastSent, checkHumanConversationGate, checkHumanQuestionGate, markHumanQuestionOpen, hasOpenHumanCorrection, clearHumanCorrection, containsCorrectionCompletionClaim } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
 
 /**
@@ -978,8 +978,9 @@ busCommand
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--deliverable', 'Treat the message body as a requested document/report; permits a multi-question list but never bypasses an unanswered prior question', false)
+  .option('--correction-task <id>', 'Completed remediation task proving an open human correction was implemented and tested')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverable?: boolean; plainText?: boolean }) => {
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverable?: boolean; correctionTask?: string; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1011,10 +1012,31 @@ busCommand
     }
 
     if (env.agentName && env.ctxRoot) {
+      let correctionTaskVerified = false;
+      if (opts.correctionTask) {
+        const taskFile = findTaskFile(resolvePaths(env.agentName, env.instanceId, env.org), opts.correctionTask);
+        if (!taskFile) {
+          console.error(`Blocked: correction task ${opts.correctionTask} was not found.`);
+          process.exit(1);
+        }
+        try {
+          const task = JSON.parse(readFileSync(taskFile, 'utf-8')) as Task;
+          correctionTaskVerified = task.status === 'completed' && Boolean(task.result?.trim());
+        } catch {
+          correctionTaskVerified = false;
+        }
+        if (!correctionTaskVerified) {
+          console.error(`Blocked: correction task ${opts.correctionTask} must be completed with a result before it can support a behaviour-change claim.`);
+          process.exit(1);
+        }
+      }
+      const correctionOpen = hasOpenHumanCorrection(env.ctxRoot, env.agentName, chatId);
       const styleGateError = checkHumanConversationGate(
         chatId,
         message,
         Boolean(opts.deliverable),
+        correctionOpen,
+        correctionTaskVerified,
       );
       if (styleGateError) {
         console.error(styleGateError);
@@ -1057,6 +1079,9 @@ busCommand
           parseMode: opts.plainText ? 'none' : 'html',
         });
         markHumanQuestionOpen(env.ctxRoot, env.agentName, chatId, message, sentMessageId);
+        if (opts.correctionTask && containsCorrectionCompletionClaim(message)) {
+          clearHumanCorrection(env.ctxRoot, env.agentName, chatId, opts.correctionTask);
+        }
         cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
         // Auto-emit activity event so dashboard sees every Telegram send,
         // even from agents that never call log-event directly.

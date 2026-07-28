@@ -31,6 +31,80 @@ function openQuestionPath(
   return join(ctxRoot, 'state', agentName, `.telegram-open-question-${safeChatId}.json`);
 }
 
+function correctionClearPath(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): string {
+  const safeChatId = String(chatId).replace(/[^0-9-]/g, '_');
+  return join(ctxRoot, 'state', agentName, `.telegram-correction-cleared-${safeChatId}.json`);
+}
+
+export function isHumanCorrection(text: string): boolean {
+  return /\bthinking aloud\b|\bjargon\b|\bnot enough\b|\btoo (?:long|much|wordy)\b|\bclearly not\b|\bfix it\b|\b(?:stop|don['’]?t)\b[\s\S]{0,60}\b(?:sending|saying|doing|thinking|writing|calling|claiming)\b|\byou(?:['’]re| are|['’]ve| have| did)?\b[\s\S]{0,80}\b(?:again|wrong|shouldn['’]?t|didn['’]?t|haven['’]?t|keep|still)\b/i.test(text);
+}
+
+export function containsBehaviourPromise(text: string): boolean {
+  return /\b(?:i|we)(?:['’]ll| will)\s+(?:do better|change|make sure|be (?:more|less|better)|stop\b|never\b|remember\b|keep (?:it|things|my)\b|not (?:do|say|send|repeat)\b|avoid\b)|\b(?:it|that)\s+won['’]?t happen again\b|\bgoing forward\b|\bfrom now on\b/i.test(text);
+}
+
+export function containsCorrectionCompletionClaim(text: string): boolean {
+  return /\b(?:fixed|sorted|resolved|corrected|updated|changed|hard-coded|hardcoded|done)\b/i.test(text);
+}
+
+function latestHumanCorrectionAt(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): number {
+  const inboundPath = join(ctxRoot, 'logs', agentName, 'inbound-messages.jsonl');
+  if (!existsSync(inboundPath)) return 0;
+  try {
+    const lines = readFileSync(inboundPath, 'utf-8').trim().split('\n').filter(Boolean).slice(-200);
+    let latest = 0;
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (String(entry.chat_id) !== String(chatId) || !isHumanCorrection(String(entry.text ?? ''))) continue;
+        const at = Date.parse(String(entry.timestamp ?? entry.archived_at ?? ''));
+        if (Number.isFinite(at) && at > latest) latest = at;
+      } catch { /* skip malformed lines */ }
+    }
+    return latest;
+  } catch {
+    return 0;
+  }
+}
+
+export function hasOpenHumanCorrection(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): boolean {
+  const correctionAt = latestHumanCorrectionAt(ctxRoot, agentName, chatId);
+  if (!correctionAt) return false;
+  try {
+    const cleared = JSON.parse(readFileSync(correctionClearPath(ctxRoot, agentName, chatId), 'utf-8'));
+    return Date.parse(String(cleared.cleared_at ?? '')) < correctionAt;
+  } catch {
+    return true;
+  }
+}
+
+export function clearHumanCorrection(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  taskId: string,
+): void {
+  const path = correctionClearPath(ctxRoot, agentName, chatId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    cleared_at: new Date().toISOString(),
+    task_id: taskId,
+  }), 'utf-8');
+}
+
 /**
  * Count direct questions in human-facing chat text.
  * URL query strings are removed first so links do not trip the gate.
@@ -54,12 +128,22 @@ export function checkHumanConversationGate(
   chatId: string | number,
   text: string,
   deliverable = false,
+  correctionOpen = false,
+  correctionTaskVerified = false,
 ): string | null {
   if (deliverable) return null;
 
   const words = countWords(text);
   if (words > 50) {
     return `Blocked: conversational Telegram replies may not exceed 50 words (received ${words}). Shorten it or use --deliverable for a requested report/document.`;
+  }
+
+  if (containsBehaviourPromise(text)) {
+    return 'Blocked: do not promise future behaviour to a person. Acknowledge briefly, make and test the change backstage, then report only the verified result.';
+  }
+
+  if (correctionOpen && containsCorrectionCompletionClaim(text) && !correctionTaskVerified) {
+    return 'Blocked: a correction is still open. A “fixed/done” claim requires --correction-task with a completed remediation task; otherwise acknowledge without claiming the behaviour changed.';
   }
 
   const thinkingAloud = /\b(?:i(?:['’]m| am)|we(?:['’]re| are))\s+(?:checking|investigating|looking into|tracing|reviewing|comparing|verifying)\b|\bi(?:['’]ll| will)\s+(?:check|investigate|look into|trace|review|compare|verify)\b/i;
