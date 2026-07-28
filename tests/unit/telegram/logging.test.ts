@@ -10,10 +10,7 @@ import {
   readLastSent,
   checkHumanQuestionGate,
   checkHumanConversationGate,
-  hasOpenHumanCorrection,
-  clearHumanCorrection,
   containsBehaviourPromise,
-  containsCorrectionCompletionClaim,
   markHumanQuestionOpen,
   countHumanQuestions,
 } from '../../../src/telegram/logging';
@@ -290,31 +287,6 @@ describe('Telegram Logging', () => {
       expect(checkHumanConversationGate('123', 'You’re right. Sorry.')).toBeNull();
     });
 
-    it('blocks a completion claim while a correction is open and unproved', () => {
-      expect(containsCorrectionCompletionClaim('Fixed and tested.')).toBe(true);
-      expect(checkHumanConversationGate('123', 'Fixed and tested.', false, true, false))
-        .toContain('correction is still open');
-    });
-
-    it('allows a completion claim backed by a completed correction task', () => {
-      expect(checkHumanConversationGate('123', 'Fixed and tested.', false, true, true)).toBeNull();
-    });
-  });
-
-  describe('human correction state', () => {
-    it('finds a correction in the inbound log and clears it only with a task receipt', () => {
-      const logDir = join(testDir, 'logs', 'bot1');
-      mkdirSync(logDir, { recursive: true });
-      writeFileSync(join(logDir, 'inbound-messages.jsonl'), JSON.stringify({
-        chat_id: '999',
-        text: 'You said you fixed it and did it wrong again.',
-        timestamp: '2026-07-28T09:00:00Z',
-      }) + '\n');
-
-      expect(hasOpenHumanCorrection(testDir, 'bot1', '999')).toBe(true);
-      clearHumanCorrection(testDir, 'bot1', '999', 'task_123');
-      expect(hasOpenHumanCorrection(testDir, 'bot1', '999')).toBe(false);
-    });
   });
 
   describe('cacheLastSent / readLastSent', () => {

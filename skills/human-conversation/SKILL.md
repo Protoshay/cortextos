@@ -106,17 +106,16 @@ forward,” “I’ll make sure,” or “that won’t happen again.” Those se
 trust without changing the behaviour.
 
 - Acknowledge briefly without a future-behaviour claim.
-- Keep the correction open as a remediation task with a concrete reproduction
-  and acceptance check.
-- Report “fixed,” “done,” or equivalent only when that task is completed with a
-  result and the same failure has been tested.
-- A changed instruction, shared file, apology, or self-rating is not acceptance.
-- For learned conversational behaviour, inspect a later real conversation.
-  Until then say the rule is available or the test passed, never that the agent
-  or fleet has changed.
-- If the same behaviour fails again, the prior correction reopens. Reduce the
-  agent's freedom on that action by moving the decision into a deterministic
-  block or required review; do not write a stronger promise.
+- Track the agent's behaviour in later real conversations, not the list of
+  fixes attempted.
+- A changed instruction, shared file, test, apology, or self-rating is never
+  proof that behaviour improved.
+- A behaviour stays unproved until at least three later conversations offered
+  a real opportunity to repeat it and the agent handled all three cleanly.
+- No opportunity means no evidence; it never counts as a clean example.
+- Any repeat resets the clean count to zero. Tighten the agent by moving that
+  decision into a deterministic block or required review; do not write a
+  stronger promise.
 
 Do not send boot, online, restart, resume, handoff, or self-state chatter unless
 the person directly requested that action and is owed its completion.
