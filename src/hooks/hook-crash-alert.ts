@@ -36,6 +36,20 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'rate-limited',
 ]);
 
+const HUMAN_SUPPRESSED_TYPES = new Set([
+  'planned-restart',
+  'session-refresh',
+  'user-restart',
+  'user-disable',
+  'user-stop',
+  'daemon-stop',
+]);
+
+/** Routine lifecycle chatter stays in backend logs, never in human chat. */
+export function shouldNotifyHuman(endType: string): boolean {
+  return !HUMAN_SUPPRESSED_TYPES.has(endType);
+}
+
 function isQuietHoursLA(now: Date): boolean {
   const laString = now.toLocaleString('en-US', {
     timeZone: 'America/Los_Angeles',
@@ -240,6 +254,11 @@ async function main(): Promise<void> {
   try {
     appendFileSync(join(logDir, 'crashes.log'), logLine);
   } catch { /* ignore */ }
+
+  // Planned lifecycle events are backend state, not human conversation.
+  if (!shouldNotifyHuman(endType)) {
+    return;
+  }
 
   // Decide whether to actually send to Telegram.
   const now = new Date();

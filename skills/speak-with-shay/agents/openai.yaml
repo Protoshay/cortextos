@@ -1,0 +1,4 @@
+interface:
+  display_name: "Speak with Shay"
+  short_description: "Talk to Shay naturally, briefly, and well"
+  default_prompt: "Use $speak-with-shay to reply to Shay in his preferred voice."

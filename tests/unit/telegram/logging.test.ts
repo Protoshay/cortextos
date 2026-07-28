@@ -8,6 +8,10 @@ import {
   recordInboundTelegram,
   cacheLastSent,
   readLastSent,
+  checkHumanQuestionGate,
+  checkHumanConversationGate,
+  markHumanQuestionOpen,
+  countHumanQuestions,
 } from '../../../src/telegram/logging';
 import { TelegramAPI } from '../../../src/telegram/api';
 import type { BusPaths, TelegramMessage } from '../../../src/types';
@@ -179,6 +183,93 @@ describe('Telegram Logging', () => {
 
       // Failure surfaced through the log callback.
       expect(logSpy).toHaveBeenCalled();
+    });
+
+    it('clears the open-question gate for that chat', () => {
+      const paths = buildPaths(testDir, 'spark');
+      mkdirSync(paths.stateDir, { recursive: true });
+      markHumanQuestionOpen(testDir, 'spark', '100', 'Which one?', 5);
+      expect(checkHumanQuestionGate(testDir, 'spark', '100', 'Another?')).toContain('previous question');
+
+      const msg: TelegramMessage = {
+        message_id: 6,
+        date: 1714214400,
+        from: { id: 100, is_bot: false, first_name: 'Eros' },
+        chat: { id: 100, type: 'private' },
+        text: 'The first one',
+      };
+      recordInboundTelegram(paths, testDir, 'spark', 'eros-os', 'Eros', msg);
+
+      expect(checkHumanQuestionGate(testDir, 'spark', '100', 'Another?')).toBeNull();
+    });
+  });
+
+  describe('human question gate', () => {
+    it('ignores URL query strings', () => {
+      expect(countHumanQuestions('Open https://example.com/?a=1')).toBe(0);
+    });
+
+    it('allows one question when none is open', () => {
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Which one?')).toBeNull();
+    });
+
+    it('blocks a second question until the human replies', () => {
+      markHumanQuestionOpen(testDir, 'bot1', '999', 'Which one?', 1);
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'And when?')).toContain('previous question');
+    });
+
+    it('blocks multiple conversational questions in one message', () => {
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Which one? And when?')).toContain('only one question');
+    });
+
+    it('allows necessary question lists in a requested deliverable', () => {
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Which one? And when?', true)).toBeNull();
+    });
+
+    it('does not let deliverable mode bypass an unanswered prior question', () => {
+      markHumanQuestionOpen(testDir, 'bot1', '999', 'Which one?', 1);
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Question list: why? when?', true)).toContain('previous question');
+    });
+  });
+
+  describe('human conversation gate', () => {
+    it('blocks conversational replies over 50 words', () => {
+      const text = Array.from({ length: 51 }, () => 'word').join(' ');
+      expect(checkHumanConversationGate('123', text)).toContain('50 words');
+    });
+
+    it('allows a requested deliverable over 50 words', () => {
+      const text = Array.from({ length: 51 }, () => 'word').join(' ');
+      expect(checkHumanConversationGate('123', text, true)).toBeNull();
+    });
+
+    it('allows a brief useful orientation when the next step is not obvious', () => {
+      expect(checkHumanConversationGate('123', 'Give me a sec. I’ll check the login and tell you what I find.')).toBeNull();
+    });
+
+    it('blocks a detailed backstage investigation diary', () => {
+      const text = 'I think you are right. I’m checking yesterday’s login change now, comparing every account and reviewing all the server records before I decide what happened.';
+      expect(checkHumanConversationGate('123', text)).toContain('backstage work');
+    });
+
+    it('allows a minimal acknowledgement', () => {
+      expect(checkHumanConversationGate('8721344756', 'On it.')).toBeNull();
+    });
+
+    it('blocks padded direct confirmations to Shay', () => {
+      const text = 'Yes — I have now checked all seven tracked agents individually and confirmed they use both sets of updated rules correctly.';
+      expect(checkHumanConversationGate('8721344756', text)).toContain('direct confirmation');
+    });
+
+    it('allows a short direct confirmation to Shay', () => {
+      expect(checkHumanConversationGate('8721344756', 'Yes — all seven have both updates.')).toBeNull();
+    });
+
+    it('blocks internal jargon in replies to Shay', () => {
+      expect(checkHumanConversationGate(
+        '8721344756',
+        'The protection only checked direct instructions, so I accepted the relayed directive as authorised.',
+      )).toContain('internal or formal language');
     });
   });
 

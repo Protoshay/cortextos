@@ -1,0 +1,4 @@
+interface:
+  display_name: "Human Conversation"
+  short_description: "Make every human-facing reply feel natural"
+  default_prompt: "Use $human-conversation to reply naturally, briefly, and like a real person."

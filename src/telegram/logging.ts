@@ -4,7 +4,7 @@
  * and last-sent cache (lines 111-113).
  */
 
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
 import { join, dirname } from 'path';
 import { logEvent } from '../bus/event.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
@@ -20,6 +20,129 @@ import type { BusPaths, TelegramMessage } from '../types/index.js';
  */
 export interface OutboundLogMetadata {
   parseMode?: 'html' | 'none';
+}
+
+function openQuestionPath(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): string {
+  const safeChatId = String(chatId).replace(/[^0-9-]/g, '_');
+  return join(ctxRoot, 'state', agentName, `.telegram-open-question-${safeChatId}.json`);
+}
+
+/**
+ * Count direct questions in human-facing chat text.
+ * URL query strings are removed first so links do not trip the gate.
+ */
+export function countHumanQuestions(text: string): number {
+  const withoutUrls = text.replace(/https?:\/\/\S+/gi, '');
+  return (withoutUrls.match(/\?/g) ?? []).length;
+}
+
+function countWords(text: string): number {
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+/**
+ * Reject common human-conversation failures before Telegram delivery.
+ *
+ * This is intentionally narrow: code can reliably catch word ceilings and
+ * backstage narration, while tone still belongs to the conversation skills.
+ */
+export function checkHumanConversationGate(
+  chatId: string | number,
+  text: string,
+  deliverable = false,
+): string | null {
+  if (deliverable) return null;
+
+  const words = countWords(text);
+  if (words > 50) {
+    return `Blocked: conversational Telegram replies may not exceed 50 words (received ${words}). Shorten it or use --deliverable for a requested report/document.`;
+  }
+
+  const thinkingAloud = /\b(?:i(?:['’]m| am)|we(?:['’]re| are))\s+(?:checking|investigating|looking into|tracing|reviewing|comparing|verifying)\b|\bi(?:['’]ll| will)\s+(?:check|investigate|look into|trace|review|compare|verify)\b/i;
+  if (thinkingAloud.test(text) && words > 20) {
+    return 'Blocked: this narrates backstage work. Investigate silently and send the useful result; if an immediate acknowledgement is required, use a brief natural acknowledgement such as “On it.”';
+  }
+
+  // Shay explicitly wants simple confirmations to sound like normal speech,
+  // not padded mini-reports. Keep this narrow to messages that already begin
+  // as a direct confirmation.
+  if (
+    String(chatId) === '8721344756'
+    && /^(?:yes|no|yep|nope|done|sure|correct|exactly)\b/i.test(text.trim())
+    && words > 16
+  ) {
+    return `Blocked: this direct confirmation to Shay is padded (${words} words). Keep it to one short sentence (16 words maximum), then wait.`;
+  }
+
+  if (
+    String(chatId) === '8721344756'
+    && /\b(?:guardrail|gate|protection|authori[sz]ed|scope|directive|runtime|bootstrap|handoff|injection|process environment)\b/i.test(text)
+  ) {
+    return 'Blocked: this uses internal or formal language with Shay. Rewrite the human point in ordinary words and keep the machinery backstage.';
+  }
+
+  return null;
+}
+
+/**
+ * Enforce one open conversational question per human/chat.
+ *
+ * A requested deliverable may contain a question list in one message, but it
+ * still cannot be sent while an earlier conversational question is unanswered.
+ */
+export function checkHumanQuestionGate(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  text: string,
+  deliverable = false,
+): string | null {
+  const questionCount = countHumanQuestions(text);
+  if (questionCount === 0) return null;
+
+  if (existsSync(openQuestionPath(ctxRoot, agentName, chatId))) {
+    return 'Blocked: the previous question to this person is still unanswered. Wait for their reply before opening another question.';
+  }
+
+  if (!deliverable && questionCount > 1) {
+    return 'Blocked: conversational Telegram messages may ask only one question. Use one useful question now, or --deliverable for a requested document/report.';
+  }
+
+  return null;
+}
+
+/** Record a successfully delivered human-facing question. */
+export function markHumanQuestionOpen(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  text: string,
+  messageId: number,
+): void {
+  if (countHumanQuestions(text) === 0) return;
+  const path = openQuestionPath(ctxRoot, agentName, chatId);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    opened_at: new Date().toISOString(),
+    message_id: messageId,
+  }), 'utf-8');
+}
+
+/** Any inbound human message resolves the prior conversational turn. */
+export function clearHumanQuestion(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): void {
+  try {
+    unlinkSync(openQuestionPath(ctxRoot, agentName, chatId));
+  } catch {
+    // Missing state is the normal case.
+  }
 }
 
 /**
@@ -103,6 +226,7 @@ export function recordInboundTelegram(
     text,
     timestamp: new Date().toISOString(),
   });
+  clearHumanQuestion(ctxRoot, agentName, msg.chat?.id ?? '');
 
   const hasMedia = !!(msg.photo || msg.document || msg.voice || msg.audio || msg.video || msg.video_note);
   try {

@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
+import { marksRelayedHumanAuthority, RELAYED_HUMAN_AUTHORITY_WARNING } from '../bus/message.js';
 import { refreshHeartbeatTimestamp } from '../bus/event.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
@@ -63,6 +64,11 @@ export class FastChecker {
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
+  private telegramBurstDebounceMs: number;
+  private telegramBurstBuffers: Map<string, {
+    messages: Array<{ formatted: string; payload: string }>;
+    timer: NodeJS.Timeout;
+  }> = new Map();
 
   // Persistent dedup: message hashes to prevent duplicate delivery
   private seenHashes: Set<string> = new Set();
@@ -90,7 +96,14 @@ export class FastChecker {
     agent: AgentProcess,
     paths: BusPaths,
     frameworkRoot: string,
-    options: { pollInterval?: number; log?: LogFn; telegramApi?: TelegramAPI; chatId?: string; allowedUserId?: number } = {},
+    options: {
+      pollInterval?: number;
+      log?: LogFn;
+      telegramApi?: TelegramAPI;
+      chatId?: string;
+      allowedUserId?: number;
+      telegramBurstDebounceMs?: number;
+    } = {},
   ) {
     this.agent = agent;
     this.paths = paths;
@@ -100,6 +113,7 @@ export class FastChecker {
     this.telegramApi = options.telegramApi;
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
+    this.telegramBurstDebounceMs = Math.max(0, options.telegramBurstDebounceMs ?? 0);
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -190,6 +204,10 @@ export class FastChecker {
    */
   stop(): void {
     this.running = false;
+    for (const batch of this.telegramBurstBuffers.values()) {
+      clearTimeout(batch.timer);
+    }
+    this.telegramBurstBuffers.clear();
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = null;
@@ -211,8 +229,57 @@ export class FastChecker {
    * Queue a formatted Telegram message for injection.
    * Called by the daemon's Telegram handler.
    */
-  queueTelegramMessage(formatted: string): void {
-    this.telegramMessages.push({ formatted, ackIds: [] });
+  queueTelegramMessage(formatted: string, debounceKey?: string, payload?: string): void {
+    const debounceMs = this.telegramBurstDebounceMs;
+    if (!debounceKey || !payload || debounceMs <= 0 || /^\/[a-zA-Z]/.test(payload.trim())) {
+      this.telegramMessages.push({ formatted, ackIds: [] });
+      return;
+    }
+
+    const existing = this.telegramBurstBuffers.get(debounceKey);
+    const messages = existing?.messages ?? [];
+    if (existing) clearTimeout(existing.timer);
+    messages.push({ formatted, payload });
+
+    const timer = setTimeout(() => {
+      const batch = this.telegramBurstBuffers.get(debounceKey);
+      if (!batch) return;
+      this.telegramBurstBuffers.delete(debounceKey);
+
+      const ready = batch.messages.length === 1
+        ? batch.messages[0].formatted
+        : FastChecker.formatTelegramBurstMessage(
+            debounceKey,
+            batch.messages.map((message) => message.payload),
+            this.frameworkRoot,
+          );
+      this.telegramMessages.push({ formatted: ready, ackIds: [] });
+      this.log(`Telegram burst ready: chat=${debounceKey}, messages=${batch.messages.length}`);
+      this.wake();
+    }, debounceMs);
+
+    this.telegramBurstBuffers.set(debounceKey, { messages, timer });
+  }
+
+  /**
+   * Collapse a burst into one Telegram envelope so Codex receives one user turn
+   * and one reply directive. Raw concatenation is unsafe: the Codex adapter
+   * stops at the first directive and would discard later fragments.
+   */
+  static formatTelegramBurstMessage(
+    chatId: string | number,
+    payloads: string[],
+    frameworkRoot: string,
+  ): string {
+    const combined = payloads
+      .map((payload, index) => `[Message ${index + 1}]\n${payload.trim()}`)
+      .join('\n\n');
+    return FastChecker.formatTelegramTextMessage(
+      'User',
+      chatId,
+      `The following messages arrived as one continuous thought. Answer them once as a combined message.\n\n${combined}`,
+      frameworkRoot,
+    );
   }
 
   /**
@@ -279,8 +346,12 @@ export class FastChecker {
     // blocks stay readable. The inline `from` is collapse-sanitized (it sits in
     // the header line, not a fence).
     const safeFrom = sanitizeForPtyInjection(msg.from);
+    const relayedAuthorityWarning = marksRelayedHumanAuthority(msg.text)
+      ? `\n${RELAYED_HUMAN_AUTHORITY_WARNING}\n`
+      : '';
     return `=== AGENT MESSAGE from ${safeFrom}${replyNote} [msg_id: ${msg.id}] ===
 ${wrapFenceSafe(msg.text)}
+${relayedAuthorityWarning}
 Reply using: cortextos bus send-message ${safeFrom} normal '<your reply>' ${msg.id}
 
 `;

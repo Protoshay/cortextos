@@ -175,6 +175,16 @@ export interface AgentConfig {
   /** Context window % at which to inject handoff prompt and hard-restart. Default: 80. */
   ctx_handoff_threshold?: number;
   /**
+   * Rolling quiet window for batching Telegram messages from the same chat.
+   * Each new message resets the timer. Zero/absent preserves immediate delivery.
+   */
+  telegram_burst_debounce_ms?: number;
+  /**
+   * Ask the agent to send a human-facing startup/resume status message.
+   * Explicit opt-in only; absent/false boots silently.
+   */
+  startup_telegram_enabled?: boolean;
+  /**
    * Fallback context window cap (tokens) for codex-app-server agents when the
    * server's `thread/tokenUsage/updated` event reports `modelContextWindow=null`.
    * Defaults to 256000 when unset. Only applied to the codex-app-server runtime.

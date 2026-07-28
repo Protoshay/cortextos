@@ -23,7 +23,7 @@ import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
-import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
+import { logOutboundMessage, cacheLastSent, checkHumanConversationGate, checkHumanQuestionGate, markHumanQuestionOpen } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
 
 /**
@@ -977,8 +977,9 @@ busCommand
   .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
+  .option('--deliverable', 'Treat the message body as a requested document/report; permits a multi-question list but never bypasses an unanswered prior question', false)
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; plainText?: boolean }) => {
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverable?: boolean; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1009,6 +1010,30 @@ busCommand
       process.exit(1);
     }
 
+    if (env.agentName && env.ctxRoot) {
+      const styleGateError = checkHumanConversationGate(
+        chatId,
+        message,
+        Boolean(opts.deliverable),
+      );
+      if (styleGateError) {
+        console.error(styleGateError);
+        process.exit(1);
+      }
+
+      const gateError = checkHumanQuestionGate(
+        env.ctxRoot,
+        env.agentName,
+        chatId,
+        message,
+        Boolean(opts.deliverable),
+      );
+      if (gateError) {
+        console.error(gateError);
+        process.exit(1);
+      }
+    }
+
     const api = new TelegramAPI(botToken);
     try {
       let sentMessageId = 0;
@@ -1031,6 +1056,7 @@ busCommand
         logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId, {
           parseMode: opts.plainText ? 'none' : 'html',
         });
+        markHumanQuestionOpen(env.ctxRoot, env.agentName, chatId, message, sentMessageId);
         cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
         // Auto-emit activity event so dashboard sees every Telegram send,
         // even from agents that never call log-event directly.

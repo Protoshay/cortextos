@@ -254,6 +254,7 @@ export class AgentManager {
       telegramApi,
       chatId,
       allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
+      telegramBurstDebounceMs: config.telegram_burst_debounce_ms,
     });
 
     // Send Telegram notification on crashes and session refreshes
@@ -351,7 +352,9 @@ export class AgentManager {
               log('Media processing returned null - falling back to text format');
               const text = stripControlChars(msg.caption || '');
               const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-              if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+              if (!checker.isDuplicate(formatted)) {
+                checker.queueTelegramMessage(formatted, String(effectiveChatId), text);
+              }
               return;
             }
 
@@ -383,12 +386,24 @@ export class AgentManager {
               return;
             }
             log(`Media message received: type=${media.type}, path=${media.image_path || media.file_path}`);
-            checker.queueTelegramMessage(formatted);
+            let burstPayload: string;
+            if (media.type === 'photo') {
+              burstPayload = `[PHOTO]\ncaption: ${media.text}\nlocal_file: ${relImagePath}`;
+            } else if (media.type === 'document') {
+              burstPayload = `[DOCUMENT]\ncaption: ${media.text}\nfile_name: ${media.file_name || ''}\nlocal_file: ${relFilePath}`;
+            } else if (media.type === 'voice' || media.type === 'audio') {
+              burstPayload = `[${media.type.toUpperCase()}]\n${media.transcript ? `transcript: ${media.transcript}\n` : ''}duration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
+            } else {
+              burstPayload = `[${media.type.toUpperCase()}]\ncaption: ${media.text}\nfile_name: ${media.file_name || ''}\nduration: ${media.duration ?? 'unknown'}s\nlocal_file: ${relFilePath}`;
+            }
+            checker.queueTelegramMessage(formatted, String(effectiveChatId), burstPayload);
           }).catch((err) => {
             log(`Media processing error: ${err} - falling back to text format`);
             const text = stripControlChars(msg.caption || '');
             const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
-            if (!checker.isDuplicate(formatted)) checker.queueTelegramMessage(formatted);
+            if (!checker.isDuplicate(formatted)) {
+              checker.queueTelegramMessage(formatted, String(effectiveChatId), text);
+            }
           });
           return;
         }
@@ -416,7 +431,10 @@ export class AgentManager {
         }
         // Pass the chat_id as the debounce key so rapid-fire messages from
         // the same chat are buffered and delivered as a single batched turn.
-        checker.queueTelegramMessage(formatted, String(effectiveChatId));
+        const burstPayload = replyToText
+          ? `[Replying to: "${replyToText.slice(0, 500)}"]\n${text}`
+          : text;
+        checker.queueTelegramMessage(formatted, String(effectiveChatId), burstPayload);
       });
 
       poller.onCallback((query) => {

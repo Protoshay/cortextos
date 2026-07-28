@@ -8,7 +8,27 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents } from '../../../src/hooks/hook-crash-alert';
+import { readMaxCrashesPerDay, notifyAgents, shouldNotifyHuman } from '../../../src/hooks/hook-crash-alert';
+
+describe('shouldNotifyHuman', () => {
+  it.each([
+    'planned-restart',
+    'session-refresh',
+    'user-restart',
+    'user-disable',
+    'user-stop',
+    'daemon-stop',
+  ])('suppresses routine lifecycle chatter: %s', (endType) => {
+    expect(shouldNotifyHuman(endType)).toBe(false);
+  });
+
+  it.each(['crash', 'daemon-crashed', 'rate-limited'])(
+    'retains actionable availability alerts: %s',
+    (endType) => {
+      expect(shouldNotifyHuman(endType)).toBe(true);
+    },
+  );
+});
 
 describe('readMaxCrashesPerDay', () => {
   let tmp: string;
