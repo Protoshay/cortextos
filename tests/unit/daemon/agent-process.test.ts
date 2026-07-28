@@ -107,6 +107,39 @@ beforeEach(() => {
   fsMocks.statSync.mockReset();
 });
 
+describe('AgentProcess startup Telegram prompts', () => {
+  it('boots silently by default on fresh, handoff, and continue paths', () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+
+    (ap as any).consumeHandoffBlock = () => '';
+    const freshPrompt = (ap as any).buildStartupPrompt();
+
+    (ap as any).consumeHandoffBlock = () => ' CONTEXT HANDOFF: Read the handoff document.';
+    const handoffPrompt = (ap as any).buildStartupPrompt();
+    const continuePrompt = (ap as any).buildContinuePrompt();
+
+    for (const prompt of [freshPrompt, handoffPrompt, continuePrompt]) {
+      expect(prompt).not.toContain('send-telegram');
+      expect(prompt).not.toContain('back online');
+      expect(prompt).not.toContain('VERY FIRST tool call');
+    }
+  });
+
+  it('only emits startup Telegram instructions when explicitly enabled', () => {
+    const ap = new AgentProcess('alice', mockEnv, { startup_telegram_enabled: true });
+
+    (ap as any).consumeHandoffBlock = () => '';
+    expect((ap as any).buildStartupPrompt()).toContain('back online');
+
+    (ap as any).consumeHandoffBlock = () => ' CONTEXT HANDOFF: Read the handoff document.';
+    const handoffPrompt = (ap as any).buildStartupPrompt();
+    expect(handoffPrompt).toContain('VERY FIRST tool call');
+    expect(handoffPrompt).toContain('send-telegram');
+
+    expect((ap as any).buildContinuePrompt()).toContain('back online');
+  });
+});
+
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
   it('stop() awaits the PTY exit handler before resolving', async () => {
     const ap = new AgentProcess('alice', mockEnv, {});

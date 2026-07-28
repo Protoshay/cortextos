@@ -110,6 +110,16 @@ export class AgentPTY {
       }
     }
 
+    // Claude Code gives ANTHROPIC_API_KEY precedence over Max-plan OAuth.
+    // A stale key inherited by the daemon therefore disables every OAuth-backed
+    // agent with an endless 401 retry loop, even when CLAUDE_CODE_OAUTH_TOKEN is
+    // valid. OAuth is the explicit per-agent credential, so never pass the
+    // ambient API key alongside it.
+    if (ptyEnv['CLAUDE_CODE_OAUTH_TOKEN']) {
+      delete ptyEnv['ANTHROPIC_API_KEY'];
+      delete ptyEnv['CLAUDE_API_KEY'];
+    }
+
     // Add convenience CTX_* aliases used throughout agent templates.
     // CTX_TELEGRAM_CHAT_ID: alias for CHAT_ID from the agent's .env
     if (ptyEnv['CHAT_ID']) {
