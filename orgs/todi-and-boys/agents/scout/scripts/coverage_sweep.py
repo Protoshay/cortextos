@@ -165,7 +165,39 @@ def get_roster():
 
 def enumerate_processes(roster_names):
     """agent -> {'runtime': str, 'pids': [int]}"""
-    pg = subprocess.run(["pgrep", "-f", "claude|codex"], capture_output=True, text=True)
+    pg = subprocess.run(["pgrep", "-f", "claude|codex"],
+                        capture_output=True, text=True, timeout=30)
+    # rc WAS DISCARDED HERE. pgrep: 0 = matched, 1 = genuinely no match, >=2 = ERROR.
+    # Reading only stdout collapses "pgrep failed" into "no agents are running", because
+    # both arrive as an empty string. That is a refusal rendered as an answer -- the same
+    # shape as a rate-limited API call returning rows=0 (skiffy fleet broadcast, 10:20Z,
+    # found by zig on gog 403s). This sweep feeds an ESCALATING 30-minute cron, so it must
+    # never be able to emit a zero it cannot stand behind: ABORT rather than under-report.
+    # Deliberately NOT merging stderr into stdout -- merging is what destroys the
+    # distinction in the first place. get_roster() above already uses this pattern.
+    # ENUMERATION CITED SO THE NEXT READER CAN CHECK IT RATHER THAN TRUST IT:
+    #   `man 1 pgrep`, EXIT STATUS, procps-ng 4.0.4 (verified at source on this box):
+    #     0 = one or more processes matched
+    #     1 = no processes matched or none of them could be signalled
+    #     2 = syntax error in the command line
+    #     3 = fatal error: out of memory etc
+    # Admitting {0,1} is the ALLOW-LIST form: exactly two codes, both with documented
+    # meanings, and rc=1 is a genuine ANSWER ("nothing matched"), not a refusal.
+    # Deliberately NOT `!= 0`, which would abort on the real possible world where no
+    # agent is running. The safety property is: DO NOT ADMIT AN EXIT CODE YOU CANNOT
+    # ENUMERATE -- not "always use != 0".
+    if pg.returncode not in (0, 1):
+        raise RuntimeError(
+            f"pgrep failed rc={pg.returncode} -- process enumeration UNKNOWN, "
+            f"NOT empty: {pg.stderr.strip()[:200]}")
+    # ENUMERATING THE CODE IS NOT ENUMERATING THE OBSERVATION (skiffy, 10:41Z).
+    # A documented rc=1 arriving WITH stderr output is not the documented case, and
+    # accepting it would launder an unknown into a clean "no agents running" -- the same
+    # shape one level down from the rc check itself.
+    if pg.returncode == 1 and pg.stderr.strip():
+        raise RuntimeError(
+            f"pgrep rc=1 (documented 'no match') but stderr is NON-EMPTY, so this is "
+            f"NOT the documented case -- enumeration UNKNOWN: {pg.stderr.strip()[:200]}")
     found = {}
     for line in pg.stdout.split():
         pid = int(line)
@@ -300,8 +332,34 @@ def build_matrix(roster, procs, sample_seconds, inject):
         elif inj == "quiet":
             cells["session_write"] = Cell(APPLIED, value="q[INJ]", fired=False)
         elif runtime != "claude":
+            # LOAD-BEARING: applicability is keyed on RUNTIME, never on file presence.
+            # DO NOT "fix" this to check whether ~/.claude/projects/*-agents-<a>/ has
+            # jsonls. It does, for codex agents, and they are NOT written by the agent
+            # session. Verified 2026-07-27: otis's dir held fresh jsonls produced by his
+            # own `claude -p "Reply with exactly AUTH_OK"` auth probes. Reading them gave
+            # a plausible, healthy-looking 191s age belonging to a different process.
+            #
+            # That is a THIRD state beyond present/absent: CONTAMINATED — present, fresh,
+            # and not his. The distinction decides which way the signal fails. An ABSENT
+            # signal fails SAFE (you know you are blind). A CONTAMINATED one fails toward
+            # HEALTHY, so a genuinely wedged codex agent would show a fresh write age
+            # forever and never trip anything.
+            #
+            # Compounding risk, also verified 2026-07-27: the CPU signal reads a false
+            # FROZEN for codex if it samples only the `node codex app-server` wrapper PID
+            # (0 ticks) instead of the whole process group (worker child burned 48 ticks
+            # in the same 23s window). If someone converts this N/A into a real signal by
+            # file presence, a false FROZEN plus a contaminated-fresh write age is TWO
+            # signals agreeing on a wrong answer, and otis gets declared WEDGED while
+            # perfectly healthy. The runtime key is the only thing preventing that today.
+            #
+            # The old reason string here claimed "no ~/.claude/projects record exists".
+            # That was FALSE from ~15:24Z on 2026-07-27 and is corrected below: the
+            # verdict was landing correctly for a reason the text misdescribed, which is
+            # precisely what invites the wrong "fix".
             cells["session_write"] = Cell(
-                NA, reason=f"{runtime}: no ~/.claude/projects record exists")
+                NA, reason=f"{runtime}: N/A by runtime — jsonls may exist but are "
+                           f"auth-probe artefacts, not agent-session writes")
         else:
             try:
                 d = mangled_project_dir(agent)
@@ -501,6 +559,83 @@ def report(matrix):
                               "suspect": suspect, "wedged": wedged}
 
 
+def provenance():
+    """Ruling #2(c): capture the SHA AT RUN TIME, BY THE SCRIPT. A SHA typed into a
+    header by hand is an assertion, not a measurement.
+
+    THE FINGERPRINT IS `git hash-object` OF THIS FILE ON DISK -- DELIBERATELY NOT HEAD.
+    HEAD describes what was COMMITTED; it does not describe what EXECUTED. With a dirty
+    working copy those are different objects, and printing HEAD would attach a clean,
+    committed-looking identifier to code that is not that code. That is a FAKE
+    PROVENANCE, and it is strictly worse than none: a header carrying a plausible SHA
+    reads as settled and nobody re-opens it, whereas a missing one still looks missing.
+    Hashing the on-disk bytes is true in every state -- clean, dirty, or untracked.
+
+    `state` is therefore the load-bearing field, not the SHA. CLEAN means the bytes that
+    ran are the bytes that are committed; anything else means the run is NOT reproducible
+    from the repo alone and the cycle must not be treated as SHA-pinned.
+
+    Every failure path emits an explicit UNRESOLVED marker rather than returning None or
+    an empty string. An ABSENT provenance line is indistinguishable from a clean one to
+    anyone reading the log months later -- the same fake-zero shape this script exists to
+    catch elsewhere -- so the failure must be loud and IN the header.
+    """
+    path = os.path.realpath(__file__)
+    run_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def git(*args):
+        return subprocess.run(("git",) + args, cwd=os.path.dirname(path),
+                              capture_output=True, text=True, timeout=10)
+
+    def line(**kw):
+        return "### PROVENANCE — " + " ".join(f"{k}={v}" for k, v in kw.items())
+
+    try:
+        ran = git("hash-object", path)
+        if ran.returncode != 0:
+            return line(script_sha="UNRESOLVED", state="UNRESOLVED", run_utc=run_utc,
+                        detail=repr(ran.stderr.strip()[:80] or "git hash-object failed"))
+        ran_sha = ran.stdout.strip()
+
+        committed = git("rev-parse", f"HEAD:./{os.path.basename(path)}")
+        head = git("rev-parse", "--short=12", "HEAD")
+        head_sha = head.stdout.strip() if head.returncode == 0 else "UNRESOLVED"
+
+        if committed.returncode != 0:
+            # DO NOT INFER A CAUSE FROM A FAILURE. An earlier version of this branch
+            # mapped EVERY non-zero rc to "UNTRACKED-IN-HEAD" -- one specific, benign
+            # cause read off an unenumerated failure space. `git rev-parse HEAD:<file>`
+            # also fails when there is NO REPO, when HEAD is unborn, when git is missing
+            # and on permission errors. The /tmp control proved the mislabel: run outside
+            # any repo it announced UNTRACKED-IN-HEAD, which is a claim about a
+            # repository that did not exist.
+            # That is skiffy's amendment-3 shape (10:34Z): enumerating the case you
+            # thought of and letting every unpredicted one wear its label. Only claim
+            # UNTRACKED when a HEAD positively resolved -- i.e. enumerate the GOOD
+            # precondition -- and fail to UNRESOLVED otherwise.
+            if head.returncode == 0:
+                state = "UNTRACKED-IN-HEAD"   # repo confirmed; file genuinely absent
+                detail = None
+            else:
+                state = "UNRESOLVED"          # cannot even establish a repo
+                detail = repr((head.stderr or committed.stderr).strip()[:80]
+                              or "no resolvable HEAD")
+            kw = dict(script_sha=ran_sha[:12], state=state, committed_sha="NONE",
+                      repo_head=head_sha, run_utc=run_utc)
+            if detail:
+                kw["detail"] = detail
+            return line(**kw)
+
+        committed_sha = committed.stdout.strip()
+        state = "CLEAN" if committed_sha == ran_sha else "DIRTY-NOT-SHA-PINNED"
+        return line(script_sha=ran_sha[:12], state=state,
+                    committed_sha=committed_sha[:12], repo_head=head_sha,
+                    run_utc=run_utc)
+    except Exception as exc:  # subprocess timeout, git absent, permissions
+        return line(script_sha="UNRESOLVED", state="UNRESOLVED", run_utc=run_utc,
+                    detail=repr(f"{type(exc).__name__}: {exc}"[:80]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample-seconds", type=int, default=22)
@@ -528,6 +663,9 @@ def main():
     matrix = build_matrix(roster, procs, args.sample_seconds, inject)
     text, summary = report(matrix)
 
+    # Emitted FIRST, and unconditionally, so every cycle in the log carries the identity
+    # of the code that produced it -- including runs that later error out mid-report.
+    print(provenance())
     if inject:
         print("### CONTROL RUN -- fault injection active: "
               + ", ".join(f"{a}:{s}={m}" for (a, s), m in inject.items()))
