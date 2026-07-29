@@ -10,16 +10,36 @@
  *
  * The fix routes `--runtime codex-app-server` (with the default --template
  * agent) at templates/agent-codex/, which: (a) documents the bus reply rule
- * prominently in AGENTS.md and TOOLS.md, (b) ships the 23 codex-compatible
- * skills under plugins/cortextos-agent-skills/skills/, and (c) sets runtime
+ * prominently in AGENTS.md and TOOLS.md, (b) ships whatever codex-compatible
+ * skills are committed under templates/agent-codex/plugins/cortextos-agent-skills/skills/
+ * (count intentionally NOT hardcoded here — see below), and (c) sets runtime
  * + model defaults in config.json.
  *
  * The scaffolder also walks the skills tree post-copy and creates one
  * <agent>__<skill> symlink per skill in ~/.codex/skills/ so codex's
  * host-wide skill discovery sees the per-agent set without collisions.
+ *
+ * Skill-count assertions below derive the expected set from the REAL
+ * on-disk template source dir (templates/agent-codex/plugins/cortextos-agent-skills/skills/)
+ * rather than a literal number. A hardcoded count silently drifts every time
+ * a skill is added/removed from the template AND can encode uncommitted
+ * local state (e.g. a hand-made symlink present on one box's working tree
+ * but never `git add`-ed) into a test that then fails on a fresh clone/CI.
+ * 2026-07-29: caught exactly this — `human-conversation` existed here only
+ * as an untracked absolute symlink to /root/cortextos/skills/human-conversation,
+ * made by hand and never committed; a literal `.toBe(24)` passed on the
+ * authoring box and would have failed everywhere else. Deriving from the
+ * source dir keeps the test honest about what's actually committed.
+ *
+ * CAVEAT (2026-07-29, skiffy): deriving the expected count from the source
+ * dir makes this test pass at both 23 and 24 — it verifies that the copy is
+ * FAITHFUL TO THE SOURCE, not that the source itself is right. If the
+ * propagation fix in task_1785312083808_62574872 silently drops a skill (or
+ * the symlinks it replaces vanish) this suite stays green. That is a
+ * different, currently-untested claim.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, lstatSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, lstatSync, statSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir, homedir } from 'os';
 import { addAgentCommand } from '../../../src/cli/add-agent';
@@ -111,9 +131,24 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(cfg.agent_name).toBe('codex-cfg');
   });
 
-  it('copies the 23 codex skills into plugins/cortextos-agent-skills/skills', async () => {
+  it('copies every skill from the template source into plugins/cortextos-agent-skills/skills, 1:1', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Ground truth: the REAL template source dir on disk (not a hardcoded
+    // number). Use statSync (follows symlinks), NOT Dirent.isDirectory()
+    // (does not follow symlinks) — copyTemplateFiles itself calls
+    // `require('fs').statSync(srcPath).isDirectory()`, so a symlinked-dir
+    // entry in the source IS followed and copied as real content. Measuring
+    // with the non-following Dirent check would under-count relative to what
+    // actually gets copied and make this assertion lie in the other direction.
+    const sourceSkillsDir = join(
+      __dirname, '..', '..', '..', 'templates', 'agent-codex',
+      'plugins', 'cortextos-agent-skills', 'skills',
+    );
+    const expectedSkills = readdirSync(sourceSkillsDir)
+      .filter(name => statSync(join(sourceSkillsDir, name)).isDirectory())
+      .sort();
 
     await addAgentCommand.parseAsync([
       'node', 'cli', 'codex-skills', '--runtime', 'codex-app-server',
@@ -127,9 +162,11 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     expect(existsSync(skillsDir)).toBe(true);
     const skills = readdirSync(skillsDir, { withFileTypes: true })
       .filter(d => d.isDirectory())
-      .map(d => d.name);
-    expect(skills.length).toBe(23);
+      .map(d => d.name)
+      .sort();
+    expect(skills).toEqual(expectedSkills);
     // Spot check: comms is the skill that teaches the Telegram reply pattern.
+    // These two are long-committed and stable, so a literal check is safe.
     expect(skills).toContain('comms');
     expect(skills).toContain('onboarding');
   });
@@ -137,6 +174,17 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
   it('creates ~/.codex/skills/<agent>__<skill> symlinks for every skill', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    // Same ground-truth approach as the copy test above: derive the expected
+    // count from the real template source dir via statSync (follows
+    // symlinks, matching copyTemplateFiles' own traversal), not a literal
+    // number and not a non-following Dirent check.
+    const sourceSkillsDir = join(
+      __dirname, '..', '..', '..', 'templates', 'agent-codex',
+      'plugins', 'cortextos-agent-skills', 'skills',
+    );
+    const expectedCount = readdirSync(sourceSkillsDir)
+      .filter(name => statSync(join(sourceSkillsDir, name)).isDirectory()).length;
 
     await addAgentCommand.parseAsync([
       'node', 'cli', 'codex-links', '--runtime', 'codex-app-server',
@@ -146,7 +194,7 @@ describe('PR-02: add-agent --runtime codex-app-server', () => {
     const codexSkillsDir = join(tempHome, '.codex', 'skills');
     expect(existsSync(codexSkillsDir)).toBe(true);
     const links = readdirSync(codexSkillsDir).filter(n => n.startsWith('codex-links__'));
-    expect(links.length).toBe(23);
+    expect(links.length).toBe(expectedCount);
 
     // Each entry must be a symlink (not a copy), pointing at the agent's local skill dir.
     for (const link of links) {

@@ -237,22 +237,37 @@ describe('FM-1: Disk full — ENOSPC write failure, no data loss on recovery', (
     scheduler.stop();
   });
 
-  it('atomicWriteSync: ENOSPC on tmp write throws; subsequent write succeeds', () => {
-    // Direct unit test: atomicWriteSync propagates write errors correctly.
-    // We simulate ENOSPC by writing to a path in a non-writable directory.
-    const readOnlyDir = join(tmpRoot, 'readonly-dir');
-    mkdirSync(readOnlyDir, { recursive: true });
-    const { chmodSync } = require('fs');
-    chmodSync(readOnlyDir, 0o555);
+  // This assertion is structurally unsatisfiable when the test runner's uid is 0:
+  // root ignores directory permission bits entirely, so a write into a 0555 dir
+  // succeeds and the expected throw never happens. This is not flakiness or an
+  // environment quirk — it cannot pass as root, on any box, ever. Skipping (not
+  // editing it into a false pass) when uid==0, loudly, via the test name itself
+  // so it is visible in the report rather than silently absorbed into a bare
+  // skip count. See CLAUDE.md's merge-precondition note for the fleet-wide
+  // context (verified 2026-07-29: this was the actual cause of npm test's
+  // "must pass" precondition being permanently unsatisfiable on root-run boxes).
+  const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
 
-    const testPath = join(readOnlyDir, 'test.json');
-    expect(() => atomicWriteSync(testPath, '{"data":1}')).toThrow();
+  it.skipIf(isRoot)(
+    'atomicWriteSync: ENOSPC on tmp write throws; subsequent write succeeds' +
+      (isRoot ? ' [SKIPPED: running as uid 0 — root ignores permission bits, this assertion is unsatisfiable here]' : ''),
+    () => {
+      // Direct unit test: atomicWriteSync propagates write errors correctly.
+      // We simulate ENOSPC by writing to a path in a non-writable directory.
+      const readOnlyDir = join(tmpRoot, 'readonly-dir');
+      mkdirSync(readOnlyDir, { recursive: true });
+      const { chmodSync } = require('fs');
+      chmodSync(readOnlyDir, 0o555);
 
-    // Restore and confirm write works
-    chmodSync(readOnlyDir, 0o755);
-    expect(() => atomicWriteSync(testPath, '{"data":2}')).not.toThrow();
-    expect(existsSync(testPath)).toBe(true);
-  });
+      const testPath = join(readOnlyDir, 'test.json');
+      expect(() => atomicWriteSync(testPath, '{"data":1}')).toThrow();
+
+      // Restore and confirm write works
+      chmodSync(readOnlyDir, 0o755);
+      expect(() => atomicWriteSync(testPath, '{"data":2}')).not.toThrow();
+      expect(existsSync(testPath)).toBe(true);
+    }
+  );
 
   it('scheduler keeps running and advances fire time even when updateCron throws', async () => {
     // Tests the error-isolation boundary: if updateCron throws (e.g. on ENOSPC),
