@@ -709,6 +709,24 @@ describe('CronScheduler', () => {
     expect(fired.some(c => c.name === 'overdue')).toBe(true);
   });
 
+  it('does not catch up an overdue cron when catchUp is disabled', async () => {
+    const twoHoursAgo = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    mockReadCrons.mockReturnValue([
+      makeCron({ name: 'overdue', schedule: '1h', last_fired_at: twoHoursAgo }),
+    ]);
+    const noCatchUp = new CronScheduler({
+      agentName: 'test-agent',
+      onFire: (cron) => { fired.push(cron); },
+      catchUp: false,
+      logger: (msg) => { logs.push(msg); },
+    });
+    noCatchUp.start();
+    await vi.advanceTimersByTimeAsync(TICK);
+    expect(fired).toHaveLength(0);
+    expect(noCatchUp.getNextFireTimes()[0].nextFireAt).toBeGreaterThan(Date.now());
+    noCatchUp.stop();
+  });
+
   it('does NOT fire on start when the cron is not yet due', async () => {
     // last_fired_at is 30 minutes ago, schedule is "1h" — not yet due
     const thirtyMinsAgo = new Date(Date.now() - 30 * 60_000).toISOString();

@@ -286,40 +286,41 @@ export class FastChecker {
    * Single poll cycle: check inbox + queued Telegram messages.
    */
   private async pollCycle(): Promise<void> {
-    let messageBlock = '';
+    let telegramBlock = '';
+    let inboxBlock = '';
     const ackIds: string[] = [];
 
     // Process queued Telegram messages
-    let hasTelegramMessage = false;
     while (this.telegramMessages.length > 0) {
       const msg = this.telegramMessages.shift()!;
-      messageBlock += msg.formatted;
-      hasTelegramMessage = true;
+      telegramBlock += msg.formatted;
     }
 
     // Check agent inbox
     const inboxMessages = checkInbox(this.paths);
     for (const msg of inboxMessages) {
-      messageBlock += this.formatInboxMessage(msg);
+      inboxBlock += this.formatInboxMessage(msg);
       ackIds.push(msg.id);
     }
 
-    // Inject if there's anything
-    if (messageBlock) {
-      const injected = this.agent.injectMessage(messageBlock);
+    // Direct human Telegram is admitted at any hour and is deliberately kept
+    // separate from autonomous inbox work so it cannot release queued work.
+    if (telegramBlock) {
+      const injected = this.agent.injectMessage(telegramBlock, 'direct-human');
       if (injected) {
-        // ACK inbox messages
-        for (const id of ackIds) {
-          ackInbox(this.paths, id);
-        }
-        this.log(`Injected ${messageBlock.length} bytes`);
-        // Only update typing timestamp for Telegram messages, not inbox/cron.
-        // Inbox messages (agent-to-agent, session continuations) must not
-        // restart the typing indicator after Stop has cleared it.
-        if (hasTelegramMessage) {
-          this.lastMessageInjectedAt = Date.now();
-        }
-        // Cooldown after injection
+        this.log(`Injected ${telegramBlock.length} direct-human bytes`);
+        this.lastMessageInjectedAt = Date.now();
+        await sleep(5000);
+      }
+    }
+
+    // Agent inbox is autonomous: outside hours injectMessage returns false and
+    // the messages remain un-ACK'd for later delivery in the next open window.
+    if (inboxBlock) {
+      const injected = this.agent.injectMessage(inboxBlock, 'agent-inbox');
+      if (injected) {
+        for (const id of ackIds) ackInbox(this.paths, id);
+        this.log(`Injected ${inboxBlock.length} agent-inbox bytes`);
         await sleep(5000);
       }
     }

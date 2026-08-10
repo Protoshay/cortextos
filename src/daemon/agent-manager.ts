@@ -15,6 +15,8 @@ import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHi
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
 import { classifyProcessedMediaType, processMediaMessage } from '../telegram/media.js';
+import type { InjectionOrigin } from './working-hours.js';
+import { isLondonWeekdayWorkingTime } from './working-hours.js';
 
 type LogFn = (msg: string) => void;
 
@@ -807,10 +809,10 @@ export class AgentManager {
    * Used by `cortextos bus test-cron-fire` to fire a cron immediately for testing.
    * Returns true if the agent is running and the inject succeeded; false otherwise.
    */
-  injectAgent(agentName: string, text: string): boolean {
+  injectAgent(agentName: string, text: string, origin: InjectionOrigin = 'unknown'): boolean {
     const entry = this.agents.get(agentName);
     if (!entry) return false;
-    return entry.process.injectMessage(text);
+    return entry.process.injectMessage(text, origin);
   }
 
   /**
@@ -901,6 +903,7 @@ export class AgentManager {
     const scheduler = new CronScheduler({
       agentName,
       onFire,
+      catchUp: false,
       logger: (msg) => console.log(`[daemon] ${msg}`),
     });
 

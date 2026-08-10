@@ -12,6 +12,7 @@ import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { getLastConfirmedLive, requeueWedgedMessages } from '../bus/message.js';
 import { resolvePaths } from '../utils/paths.js';
+import { admitInjection, type InjectionOrigin } from './working-hours.js';
 
 type LogFn = (msg: string) => void;
 
@@ -345,8 +346,13 @@ export class AgentProcess {
   /**
    * Inject a message into the agent's PTY.
    */
-  injectMessage(content: string): boolean {
+  injectMessage(content: string, origin: InjectionOrigin = 'unknown'): boolean {
     if (!this.pty || this.status !== 'running') {
+      return false;
+    }
+
+    if (!admitInjection(this.config, origin)) {
+      this.log(`Working-hours gate: deferred ${origin} injection outside Europe/London weekday 07:00-19:00`);
       return false;
     }
 
@@ -571,9 +577,10 @@ export class AgentProcess {
     }
 
     const nowUtc = new Date().toISOString();
-    const reminderBlock = this.buildReminderBlock();
-    const deliverablesBlock = this.buildDeliverablesBlock();
-    const handoffBlock = this.consumeHandoffBlock();
+    const autonomousOpen = admitInjection(this.config, 'startup-proactive');
+    const reminderBlock = autonomousOpen ? this.buildReminderBlock() : '';
+    const deliverablesBlock = autonomousOpen ? this.buildDeliverablesBlock() : '';
+    const handoffBlock = autonomousOpen ? this.consumeHandoffBlock() : '';
     const isHandoffRestart = handoffBlock.length > 0;
     const startupTelegramEnabled = this.config.startup_telegram_enabled === true;
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
@@ -582,7 +589,7 @@ export class AgentProcess {
     const handoffUxOverride = isHandoffRestart && startupTelegramEnabled
       ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment".'
       : '';
-    const onlineMessage = isHandoffRestart || !startupTelegramEnabled
+    const onlineMessage = !autonomousOpen || isHandoffRestart || !startupTelegramEnabled
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
     return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
@@ -590,12 +597,16 @@ export class AgentProcess {
 
   private buildContinuePrompt(): string {
     const nowUtc = new Date().toISOString();
-    const reminderBlock = this.buildReminderBlock();
-    const deliverablesBlock = this.buildDeliverablesBlock();
-    const onlineMessage = this.config.startup_telegram_enabled === true
+    const autonomousOpen = admitInjection(this.config, 'startup-proactive');
+    const reminderBlock = autonomousOpen ? this.buildReminderBlock() : '';
+    const deliverablesBlock = autonomousOpen ? this.buildDeliverablesBlock() : '';
+    const onlineMessage = autonomousOpen && this.config.startup_telegram_enabled === true
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
-    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
+    const resumeInstruction = autonomousOpen
+      ? ' Check inbox. Resume normal operations.'
+      : ' Remain idle. Outside working hours, act only on a direct human message to this agent and only for that request.';
+    return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${resumeInstruction}${onlineMessage}`;
   }
 
   /**

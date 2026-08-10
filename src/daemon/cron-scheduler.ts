@@ -238,12 +238,15 @@ export interface CronSchedulerOptions {
   agentName: string;
   onFire: (cron: CronDefinition) => Promise<void> | void;
   logger?: (msg: string) => void;
+  /** Preserve legacy missed-fire catch-up. Daemon wiring disables this. */
+  catchUp?: boolean;
 }
 
 export class CronScheduler {
   private readonly agentName: string;
   private readonly onFire: (cron: CronDefinition) => Promise<void> | void;
   private readonly logger: (msg: string) => void;
+  private readonly catchUp: boolean;
 
   /** In-memory schedule, keyed by cron name. */
   private scheduled: Map<string, ScheduledCron> = new Map();
@@ -271,6 +274,7 @@ export class CronScheduler {
     this.agentName = opts.agentName;
     this.onFire    = opts.onFire;
     this.logger    = opts.logger ?? ((msg: string) => process.stdout.write(msg + '\n'));
+    this.catchUp   = opts.catchUp ?? true;
   }
 
   // -------------------------------------------------------------------------
@@ -394,7 +398,7 @@ export class CronScheduler {
       if (def.last_fired_at) candidates.push(new Date(def.last_fired_at).getTime());
       if (def.last_fire_attempted_at) candidates.push(new Date(def.last_fire_attempted_at).getTime());
       if (stateFire) candidates.push(new Date(stateFire).getTime());
-      const referenceMs = candidates.length > 0 ? Math.max(...candidates) : now;
+      const referenceMs = this.catchUp && candidates.length > 0 ? Math.max(...candidates) : now;
 
       let nextFireAt = computeNextFireAt(def, referenceMs);
 
@@ -408,7 +412,7 @@ export class CronScheduler {
       // CATCH-UP POLICY: if nextFireAt is in the past (daemon was stopped),
       // fire once immediately for the missed window, then recompute from now.
       // We do NOT flood-fire all missed windows — one catch-up is sufficient.
-      if (nextFireAt <= now) {
+      if (this.catchUp && nextFireAt <= now) {
         this.logger(
           `[cron-scheduler] catch-up: cron "${def.name}" missed fire at ${new Date(nextFireAt).toISOString()} — scheduling immediate fire`
         );
