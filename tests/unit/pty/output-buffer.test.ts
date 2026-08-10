@@ -79,6 +79,18 @@ describe('OutputBuffer redaction', () => {
     expect(buf.isBootstrapped()).toBe(true);
   });
 
+  it('detects the current Claude Code ready status bar', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    buf.push('\x1b[38;5;246m (shift+tab to cycle)\x1b[0m');
+    expect(buf.isBootstrapped()).toBe(true);
+  });
+
+  it('does not treat ordinary startup output as ready', () => {
+    const buf = new OutputBuffer(1000, '/tmp/fake-stdout.log');
+    buf.push('Starting Claude Code…');
+    expect(buf.isBootstrapped()).toBe(false);
+  });
+
   it('chunk-boundary edge case is NOT redacted (documents the known limitation)', () => {
     // Split a JWT across two push() calls. Neither chunk matches the
     // regex on its own — the redactor is stateless and chunk-local. This

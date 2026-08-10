@@ -108,6 +108,12 @@ export class OutputBuffer {
       if (cleaned.includes('trust') && !cleaned.includes('> ')) {
         return false;
       }
+      // Claude Code's current status bar no longer includes the literal
+      // "permissions" text. It exposes the ready input state as
+      // "(shift+tab to cycle)" instead. Accept both generations so fresh
+      // restart verification observes the real ready screen rather than
+      // timing out and restarting an already-usable agent again.
+      return cleaned.includes('permissions') || cleaned.includes('shift+tab to cycle');
     }
 
     return cleaned.includes(this.bootstrapPattern);

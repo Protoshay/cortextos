@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { spawnSync, execFileSync } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
+import { join, resolve as resolvePath } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
 import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks, findTaskFile } from '../bus/task.js';
@@ -612,6 +612,31 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const tasks = checkHumanTasks(paths);
     console.log(JSON.stringify(tasks));
+  });
+
+busCommand
+  .command('close-receipt')
+  .description('Submit a verified weekday-close artifact receipt to the daemon')
+  .argument('<stage>', 'memory, task-truth, or knowledge')
+  .argument('<paths...>', 'Durable artifact paths written during this close lifecycle')
+  .action(async (stage: string, paths: string[]) => {
+    if (!['memory', 'task-truth', 'knowledge'].includes(stage)) {
+      console.error(`Invalid close stage: ${stage}`);
+      process.exit(1);
+    }
+    const env = resolveEnv();
+    const ipc = new IPCClient(env.instanceId);
+    const response = await ipc.send({
+      type: 'close-receipt',
+      agent: env.agentName,
+      source: 'cortextos bus close-receipt',
+      data: { stage, paths: paths.map(path => resolvePath(path)) },
+    });
+    if (!response.success) {
+      console.error(response.error || 'Close receipt rejected');
+      process.exit(1);
+    }
+    console.log(JSON.stringify(response.data));
   });
 
 busCommand

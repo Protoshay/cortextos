@@ -626,6 +626,23 @@ export class IPCServer {
           }
           break;
 
+        case 'close-receipt': {
+          const stage = request.data?.stage;
+          const paths = request.data?.paths;
+          if (!request.agent || !['memory', 'task-truth', 'knowledge'].includes(stage as string) ||
+              !Array.isArray(paths) || paths.length === 0 || !paths.every(path => typeof path === 'string')) {
+            response = { success: false, error: 'close-receipt requires agent, valid stage, and one or more artifact paths' };
+          } else {
+            const state = await this.agentManager.submitCloseReceipt(
+              request.agent,
+              stage as 'memory' | 'task-truth' | 'knowledge',
+              paths as string[],
+            );
+            response = { success: true, data: state };
+          }
+          break;
+        }
+
         case 'wake':
           // Wake a specific agent's fast checker (replaces SIGUSR1)
           if (request.agent) {

@@ -17,6 +17,7 @@ import { stripControlChars } from '../utils/validate.js';
 import { classifyProcessedMediaType, processMediaMessage } from '../telegram/media.js';
 import type { InjectionOrigin } from './working-hours.js';
 import { isLondonWeekdayWorkingTime } from './working-hours.js';
+import { CloseLifecycleCoordinator, waitForReadySession, type CloseStage } from './close-lifecycle.js';
 
 type LogFn = (msg: string) => void;
 
@@ -35,12 +36,46 @@ export class AgentManager {
   private ctxRoot: string;
   private frameworkRoot: string;
   private org: string;
+  private closeLifecycle: CloseLifecycleCoordinator;
+  private closeLifecycleTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(instanceId: string, ctxRoot: string, frameworkRoot: string, org: string) {
     this.instanceId = instanceId;
     this.ctxRoot = ctxRoot;
     this.frameworkRoot = frameworkRoot;
     this.org = org;
+    this.closeLifecycle = new CloseLifecycleCoordinator({
+      ctxRoot,
+      listAgents: () => this.getCloseLifecycleAgents(),
+      injectPrompt: (agent, prompt) => this.injectAgent(agent, prompt, 'system'),
+      currentSessionIdentity: agent => {
+        const status = this.getAgentStatus(agent);
+        return status?.status === 'running' && status.pid && status.sessionStart
+          ? `${status.pid}:${status.sessionStart}`
+          : undefined;
+      },
+      requestFreshRestart: async (agent, reason, attemptId) => {
+        const stateDir = join(this.ctxRoot, 'state', agent);
+        mkdirSync(stateDir, { recursive: true });
+        writeFileSync(join(stateDir, '.force-fresh'), reason + '\n', 'utf-8');
+        await this.restartAgent(agent);
+        const readyIdentity = await waitForReadySession(() => {
+          const entry = this.agents.get(agent);
+          const status = entry?.process.getStatus();
+          return {
+            bootstrapped: entry?.process.isBootstrapped() ?? false,
+            identity: status?.status === 'running' && status.pid && status.sessionStart
+              ? `${status.pid}:${status.sessionStart}`
+              : undefined,
+          };
+        }, 120_000);
+        if (!readyIdentity) {
+          throw new Error(`Fresh session for ${agent} did not bootstrap within 120000ms`);
+        }
+        return readyIdentity;
+      },
+      log: message => console.log(message),
+    });
   }
 
   /**
@@ -72,7 +107,37 @@ export class AgentManager {
       // of falling back to `this.org` (the daemon's startup org).
       await this.startAgent(name, dir, config, org);
     }
+    await this.closeLifecycle.tick();
+    if (!this.closeLifecycleTimer) {
+      this.closeLifecycleTimer = setInterval(() => {
+        this.closeLifecycle.tick().catch(err => console.error('[close-lifecycle] tick failed:', err));
+      }, 60_000);
+    }
   }
+
+  private getCloseLifecycleAgents() {
+    return this.getAgentNames()
+      .map(name => ({ name, org: this.resolveAgentOrg(name) }))
+      .filter(({ org }) => org === 'todi-and-boys')
+      .map(({ name, org }) => ({
+        name,
+        artifactRoots: {
+          memory: [join(this.frameworkRoot, 'orgs', org, 'agents', name, 'memory')].filter(path => existsSync(path)),
+          'task-truth': [join(this.ctxRoot, 'orgs', org, 'tasks')].filter(path => existsSync(path)),
+          knowledge: [
+            join(this.frameworkRoot, 'orgs', org, 'knowledge.md'),
+            join(this.frameworkRoot, 'orgs', org, 'wiki'),
+          ].filter(path => existsSync(path)),
+        },
+      }));
+  }
+
+  async submitCloseReceipt(agent: string, stage: CloseStage, paths: string[]) {
+    const subject = this.getCloseLifecycleAgents().find(item => item.name === agent);
+    if (!subject) throw new Error(`Agent ${agent} not found`);
+    return this.closeLifecycle.receipt(subject, stage, paths);
+  }
+
 
   /**
    * Read the instance-level enabled-agents.json registry.
@@ -675,6 +740,10 @@ export class AgentManager {
    * time `pty.kill()` runs, every agent already has its marker on disk.
    */
   async stopAll(): Promise<void> {
+    if (this.closeLifecycleTimer) {
+      clearInterval(this.closeLifecycleTimer);
+      this.closeLifecycleTimer = null;
+    }
     const names = [...this.agents.keys()];
 
     for (const name of names) {

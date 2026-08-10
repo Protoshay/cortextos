@@ -619,6 +619,7 @@ export type IPCCommandType =
   | 'start-agent'
   | 'stop-agent'
   | 'restart-agent'
+  | 'close-receipt'
   | 'wake'
   | 'list-agents'
   | 'spawn-worker'
