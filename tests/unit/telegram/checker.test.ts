@@ -12,6 +12,7 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  existsSync,
 } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -28,6 +29,7 @@ import {
   EMPTY_APOLOGY_REGEX,
   buildRecentEvidence,
   assembleCheckerContext,
+  recordGeraldToldGateShadow,
 } from '../../../src/telegram/checker.js';
 import type {
   ModelClient,
@@ -387,6 +389,64 @@ describe('validateDeliverableClaim', () => {
   it('returns deliverable=false when log file does not exist', () => {
     const r = validateDeliverableClaim(dir, 'no-such-agent', SHAY, 42);
     expect(r.deliverable).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 2b. recordGeraldToldGateShadow — STEP 2, record-only told-gate shadow log
+// ---------------------------------------------------------------------------
+
+describe('recordGeraldToldGateShadow', () => {
+  const GERALD = '8602224961';
+  let dir: string;
+
+  beforeEach(() => {
+    dir = tmpDir();
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function readShadowLog(d: string, agent: string): any[] {
+    const path = join(d, 'logs', agent, 'gerald-told-gate-shadow.jsonl');
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l));
+  }
+
+  it('writes one entry with items_declared=true and parsed items when geraldItems is set', () => {
+    recordGeraldToldGateShadow(dir, 'rimu', GERALD, 'Here is the digest.', '123,456');
+    const rows = readShadowLog(dir, 'rimu');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].items_declared).toBe(true);
+    expect(rows[0].items).toEqual(['123', '456']);
+    expect(rows[0].chat_id).toBe(GERALD);
+    expect(rows[0].agent).toBe('rimu');
+    expect(rows[0].text_preview).toBe('Here is the digest.');
+  });
+
+  it('writes one entry with items_declared=false and items=null when geraldItems is undefined', () => {
+    recordGeraldToldGateShadow(dir, 'rimu', GERALD, 'Nothing new today.', undefined);
+    const rows = readShadowLog(dir, 'rimu');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].items_declared).toBe(false);
+    expect(rows[0].items).toBeNull();
+  });
+
+  it('is a true no-op for any chat other than Gerald — no log file is created', () => {
+    recordGeraldToldGateShadow(dir, 'rimu', SHAY, 'Some unrelated message.', '123');
+    const path = join(dir, 'logs', 'rimu', 'gerald-told-gate-shadow.jsonl');
+    expect(existsSync(path)).toBe(false);
+  });
+
+  it('never throws even when the log directory cannot be created', () => {
+    const file = join(dir, 'blocker');
+    writeFileSync(file, 'block');
+    expect(() =>
+      recordGeraldToldGateShadow(file, 'rimu', GERALD, 'x', undefined),
+    ).not.toThrow();
   });
 });
 

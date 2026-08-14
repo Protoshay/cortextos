@@ -55,6 +55,7 @@ import {
   assembleCheckerContext,
   createOpenAIClient,
   createCodexClient,
+  recordGeraldToldGateShadow,
   type CheckerConfig,
   type ModelClient,
   type CheckerAuditEntry,
@@ -75,6 +76,12 @@ export interface HumanSendRequest {
   text: string;
   /** Triggering inbound message ID for deliverable validation. */
   deliverableForMsgId?: number;
+  /**
+   * Gerald told-gate declaration (Monday item IDs, comma-separated) — STEP 2
+   * of the staged told-gate rollout: record-only, not yet enforced. See
+   * orgs/todi-and-boys/agents/rimu/scripts/plan_told_gate_shared_state.md §4.
+   */
+  geraldItems?: string;
   correctionOf?: number;
   image?: string;
   file?: string;
@@ -161,6 +168,18 @@ export class TelegramSendService {
         },
       };
     }
+
+    // Gerald told-gate shadow record (STEP 2 — record-only, non-enforcing).
+    // Fires first, unconditionally, so it captures every attempt (rejected
+    // or accepted) rather than only sends that clear later gates. True no-op
+    // for every chat other than Gerald's. Never blocks or alters this send.
+    recordGeraldToldGateShadow(
+      this.ctxRoot,
+      this.agentName,
+      req.chatId,
+      req.text,
+      req.geraldItems,
+    );
 
     // Gate 3: Validate deliverable claim (reads inbound log).
     const { deliverable, triggeringText } = validateDeliverableClaim(

@@ -1032,8 +1032,9 @@ busCommand
   .option('--file <path>', 'Send a document/file with caption (any file type)')
   .option('--deliverable-for <inbound-message-id>', 'Treat the message as a requested deliverable; provide the inbound message ID that requested it. The daemon verifies the ID exists in the inbound log before relaxing word limits.')
   .option('--correction-of <message-id>', 'Correct your immediately preceding message in this chat; bypasses only the 10-second cadence block after the message ID is verified')
+  .option('--items <ids>', 'Comma-separated Monday.com item IDs this message is about (told-gate declaration, currently record-only — see plan_told_gate_shared_state.md).')
   .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverableFor?: string; correctionOf?: string; plainText?: boolean }) => {
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverableFor?: string; correctionOf?: string; items?: string; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
@@ -1069,6 +1070,7 @@ busCommand
           text: message,
           deliverableForMsgId,
           correctionOf,
+          geraldItems: opts.items,
           image: opts.image,
           file: opts.file,
           plainText: opts.plainText === true,

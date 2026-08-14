@@ -407,6 +407,66 @@ export function validateDeliverableClaim(
 }
 
 // ---------------------------------------------------------------------------
+// Gerald told-gate shadow log (STEP 2 — record-only, non-enforcing)
+// ---------------------------------------------------------------------------
+
+/** Gerald's Telegram chat ID. The shadow log fires for this chat only. */
+const GERALD_CHAT_ID = '8602224961';
+
+/**
+ * Record-only "told-gate" declaration for Gerald-facing sends.
+ *
+ * STEP 2 of the staged told-gate rollout (see
+ * orgs/todi-and-boys/agents/rimu/scripts/plan_told_gate_shared_state.md §4).
+ * This function is pure record-keeping: it appends a shadow-log entry
+ * describing what the producer declared, so a later diff can compare the
+ * declaration against what was actually sent. It NEVER blocks, rejects, or
+ * alters a send, and it has no return value. Enforcement is a separate,
+ * not-yet-approved step 3.
+ *
+ * True no-op for every chat other than Gerald's — no file I/O occurs.
+ * Never throws: failures are swallowed, mirroring writeCheckerAudit above.
+ */
+export function recordGeraldToldGateShadow(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  text: string,
+  geraldItems: string | undefined,
+): void {
+  if (String(chatId) !== GERALD_CHAT_ID) return;
+
+  try {
+    const itemsDeclared = typeof geraldItems === 'string' && geraldItems.trim().length > 0;
+    const items = itemsDeclared
+      ? geraldItems!
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0)
+      : null;
+
+    const entry = {
+      timestamp: new Date().toISOString(),
+      agent: agentName,
+      chat_id: String(chatId),
+      items_declared: itemsDeclared,
+      items,
+      text_preview: text.slice(0, 100),
+    };
+
+    const logDir = join(ctxRoot, 'logs', agentName);
+    mkdirSync(logDir, { recursive: true });
+    appendFileSync(
+      join(logDir, 'gerald-told-gate-shadow.jsonl'),
+      JSON.stringify(entry) + '\n',
+      'utf-8',
+    );
+  } catch {
+    // Non-fatal: shadow-log write failures are swallowed and never block a send.
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Stage 2: Semantic check
 // ---------------------------------------------------------------------------
 

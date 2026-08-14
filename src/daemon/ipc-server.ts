@@ -861,6 +861,8 @@ export class IPCServer {
             chatId?: string;
             text?: string;
             deliverableForMsgId?: number;
+            /** Gerald told-gate declaration — STEP 2, record-only, not enforced. */
+            geraldItems?: string;
             correctionOf?: number;
             image?: string;
             file?: string;
@@ -902,6 +904,8 @@ export class IPCServer {
               typeof d.deliverableForMsgId === 'number'
                 ? d.deliverableForMsgId
                 : undefined,
+            geraldItems:
+              typeof d.geraldItems === 'string' ? d.geraldItems : undefined,
             correctionOf:
               typeof d.correctionOf === 'number' ? d.correctionOf : undefined,
             image: typeof d.image === 'string' ? d.image : undefined,
