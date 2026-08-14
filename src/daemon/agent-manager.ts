@@ -59,6 +59,14 @@ export class AgentManager {
         const stateDir = join(this.ctxRoot, 'state', agent);
         mkdirSync(stateDir, { recursive: true });
         writeFileSync(join(stateDir, '.force-fresh'), reason + '\n', 'utf-8');
+        // Also drop the .restart-planned marker so hook-crash-alert.ts (a
+        // SessionEnd hook) classifies this session end as endType
+        // 'planned-restart' instead of falling through to its 'crash'
+        // default. Without this, every weekday-close restart fired a false
+        // "🚨 CRASH" Telegram alert even though the session ended cleanly.
+        // Mirrors src/bus/system.ts's hardRestart(), which writes both
+        // markers for the same reason.
+        writeFileSync(join(stateDir, '.restart-planned'), reason + '\n', 'utf-8');
         await this.restartAgent(agent);
         const readyIdentity = await waitForReadySession(() => {
           const entry = this.agents.get(agent);
