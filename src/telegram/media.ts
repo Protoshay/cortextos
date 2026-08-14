@@ -45,6 +45,18 @@ export function classifyProcessedMediaType(value: string): ProcessedMediaType | 
   }
 }
 
+export function formatUnknownMediaPayload(
+  caption: string,
+  reason: 'unrecognised_type' | 'processing_failed',
+): string {
+  return [
+    '[UNKNOWN_MEDIA]',
+    `caption: ${caption}`,
+    `reason: ${reason}`,
+    'status: UNKNOWN — attachment was not processed',
+  ].join('\n');
+}
+
 /**
  * Sanitize a filename by stripping unsafe characters.
  * Keeps only a-zA-Z0-9._- and limits to 200 chars.

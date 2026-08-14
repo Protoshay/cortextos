@@ -9,8 +9,10 @@ import { refreshHeartbeatTimestamp } from '../bus/event.js';
 import { updateApproval } from '../bus/approval.js';
 import { AgentProcess } from './agent-process.js';
 import type { TelegramAPI } from '../telegram/api.js';
+import type { TelegramSendService } from './telegram-send-service.js';
 import { KEYS } from '../pty/inject.js';
 import { stripControlChars, sanitizeForPtyInjection, wrapFenceSafe } from '../utils/validate.js';
+import { atomicWriteSync } from '../utils/atomic.js';
 
 type LogFn = (msg: string) => void;
 
@@ -61,6 +63,8 @@ export class FastChecker {
   private telegramApi?: TelegramAPI;
   private chatId?: string;
   private allowedUserId?: number;
+  /** Daemon-owned send service — used for sendDirect() calls from lines 982, 1220. */
+  private sendService?: TelegramSendService;
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
@@ -80,6 +84,10 @@ export class FastChecker {
   // Idle-session heartbeat watchdog
   private heartbeatTimer: NodeJS.Timeout | null = null;
 
+  // Org (best-effort default so existing call sites/tests that don't pass it
+  // keep working unchanged). Not yet read anywhere in this file.
+  private org: string;
+
   // Context monitor state
   private ctxConfigMtime: number = 0;
   private ctxWarningFiredAt: number = 0;    // dedup: 15min cooldown between warnings
@@ -91,6 +99,14 @@ export class FastChecker {
   private ctxCircuitBrokenAt: number | null = null; // when circuit tripped (null = healthy)
   // Persisted to disk so --continue restarts don't reset the circuit breaker
   private ctxCircuitFile: string = '';
+  // Per-agent, externally-readable mirror of the Tier 3 armed state (ctxHandoffDeadlineAt /
+  // ctxHandoffZeroedAt above). Those two fields were private in-memory state with no pollable
+  // artifact: an agent asked to yield to Tier 3 had no way to confirm it was actually armed for
+  // its session, and a daemon restart between Tier 2 firing and the deadline silently zeroed
+  // them, making the grace period effectively infinite with no trace. Written when the deadline
+  // is armed, removed when it resolves (self-resolved or force-restarted) — see
+  // persistCtxHandoffDeadline()/clearCtxHandoffDeadline().
+  private ctxHandoffDeadlineFile: string = '';
 
   constructor(
     agent: AgentProcess,
@@ -103,6 +119,8 @@ export class FastChecker {
       chatId?: string;
       allowedUserId?: number;
       telegramBurstDebounceMs?: number;
+      sendService?: TelegramSendService;
+      org?: string;
     } = {},
   ) {
     this.agent = agent;
@@ -114,6 +132,8 @@ export class FastChecker {
     this.chatId = options.chatId;
     this.allowedUserId = options.allowedUserId;
     this.telegramBurstDebounceMs = Math.max(0, options.telegramBurstDebounceMs ?? 0);
+    this.sendService = options.sendService;
+    this.org = options.org ?? 'default';
 
     // Initialize persistent dedup
     this.dedupFilePath = join(paths.stateDir, '.message-dedup-hashes');
@@ -122,6 +142,19 @@ export class FastChecker {
     // Load persisted circuit breaker state so --continue restarts don't reset it
     this.ctxCircuitFile = join(paths.stateDir, '.ctx-circuit.json');
     this.loadCtxCircuit();
+
+    // Per-agent readable Tier 3 arming state — same directory convention as
+    // context_status.json / heartbeat.json (state/<agent>/, non-dotted: meant to be
+    // externally polled, not just an internal daemon marker).
+    this.ctxHandoffDeadlineFile = join(paths.stateDir, 'ctx_handoff_deadline.json');
+  }
+
+  /**
+   * Wire the TelegramSendService after construction (avoids forward-ref issues
+   * since sendService is built after the checker in startAgent).
+   */
+  setSendService(svc: TelegramSendService): void {
+    this.sendService = svc;
   }
 
   /**
@@ -914,7 +947,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         `message_id: ${messageId}`,
         `Reply using: cortextos bus send-telegram ${chatId} '<your reply>'`,
       ].join('\n');
-      const injected = this.agent.injectMessage(msg);
+      const injected = this.agent.injectMessage(msg, 'direct-human');
       if (injected && this.telegramApi) {
         try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Got it'); } catch { /* ignore */ }
       }
@@ -980,7 +1013,11 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         }]);
       }
 
-      await this.telegramApi.sendMessage(this.chatId, msg, { inline_keyboard: keyboard });
+      if (this.sendService) {
+        await this.sendService.sendDirect(this.chatId, msg, { replyMarkup: { inline_keyboard: keyboard } });
+      } else if (this.telegramApi) {
+        await this.telegramApi.sendMessage(this.chatId, msg, { inline_keyboard: keyboard });
+      }
       this.log(`Sent question ${questionIdx + 1}/${totalQ} to Telegram`);
     } catch (err) {
       this.log(`sendNextQuestion error: ${err}`);
@@ -1016,7 +1053,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         // daemon containment headers.
         if (content) {
           const urgentMsg = `=== URGENT SIGNAL ===\n${wrapFenceSafe(content)}\n\n`;
-          this.agent.injectMessage(urgentMsg);
+          this.agent.injectMessage(urgentMsg, 'system');
         }
       } catch (err) {
         this.log(`Error processing urgent signal: ${err}`);
@@ -1072,6 +1109,26 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     const statusPath = join(this.paths.stateDir, 'context_status.json');
     if (!existsSync(statusPath)) return;
 
+    // Check PTY output for hard API overflow errors (always act regardless of threshold config).
+    // MOVED ABOVE the staleness return below (task_1785785896218, skiffy gate 2026-08-03T19:3xZ):
+    // this is the ONLY leg that does not depend on context_status.json's CONTENT — it reads live
+    // PTY bytes via getOutputBuffer(), never pct/exceeds200k/writtenAt. Gating it on the bridge
+    // file's freshness silently disabled wedge detection on exactly the agents most likely to be
+    // wedged (a wedged agent's statusLine hook stops firing, so its own file goes stale, so the
+    // one check that would have caught it was the one the staleness gate switched off).
+    // Blast-radius note, named per the task's requirement: this does NOT act on a stale or absent
+    // pct reading — isContextWedged() never touches `data`, so a stale bridge file changes nothing
+    // about this check's correctness. It still requires the file to EXIST (existsSync above,
+    // unchanged) and still respects the circuit-breaker pause (unchanged, above). Only the
+    // `age > 10 * 60_000` staleness gate below (and the JSON-parse catch it lives inside) is
+    // bypassed, and only for this one leg.
+    const recentOutput = this.agent.getOutputBuffer()?.getRecent(8000) ?? '';
+    if (isContextWedged(recentOutput)) {
+      this.log('Context wedge detected in PTY output (API overflow or client-side context-limit prompt) — force restarting');
+      this.forceContextRestart('context wedge in PTY output (API overflow or client-side context-limit prompt)');
+      return;
+    }
+
     let pct: number | null = null;
     let exceeds200k = false;
     let writtenAt = 0;
@@ -1094,19 +1151,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
           this.ctxHandoffDeadlineAt = 0;
           this.ctxWarningFiredAt = 0;
           this.ctxHandoffZeroedAt = 0;
+          this.clearCtxHandoffDeadline();
           this.log(`New session detected (${incomingSessionId.slice(0, 8)}…) — per-session ctx state reset`);
         }
         this.ctxLastSessionId = incomingSessionId;
       }
     } catch { return; }
-
-    // Check PTY output for hard API overflow errors (always act regardless of threshold config)
-    const recentOutput = this.agent.getOutputBuffer()?.getRecent(8000) ?? '';
-    if (isContextWedged(recentOutput)) {
-      this.log('Context wedge detected in PTY output (API overflow or client-side context-limit prompt) — force restarting');
-      this.forceContextRestart('context wedge in PTY output (API overflow or client-side context-limit prompt)');
-      return;
-    }
 
     // CLASS EXCLUSION: codex-backed runtimes do not expose a context OCCUPANCY signal.
     // codex-app-server's thread/tokenUsage total is a CUMULATIVE token counter over the
@@ -1150,6 +1200,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         this.ctxHandoffFiredAt = 0;
         this.ctxWarningFiredAt = 0;
         this.ctxHandoffZeroedAt = 0;
+        this.clearCtxHandoffDeadline();
         // Tier 2 pre-armed .force-fresh in case the agent never acted. It DID act, so clear the
         // marker. shouldContinue() consumes it on the next restart of ANY kind, which would
         // otherwise silently turn a routine restart into a history-discarding fresh boot.
@@ -1170,7 +1221,7 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       this.ctxWarningFiredAt = now;
       const pctRound = Math.round(effectivePct);
       const statusSuffix = effectivePct >= handoff ? 'Handoff in progress.' : `Handoff triggers at ${handoff}%.`;
-      this.agent.injectMessage(`[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`);
+      this.agent.injectMessage(`[CONTEXT] Window at ${pctRound}%. ${statusSuffix}`, 'system');
       this.log(`Context warning fired at ${pctRound}%`);
     }
 
@@ -1188,9 +1239,12 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       try {
         writeFileSync(statusPath, JSON.stringify({ used_percentage: 0, exceeds_200k_tokens: false, written_at: zeroedAt.toISOString() }));
       } catch { /* non-fatal */ }
+      // Tier 3 is now armed — persist it so it's externally readable (see
+      // persistCtxHandoffDeadline doc comment for why this matters).
+      this.persistCtxHandoffDeadline(effectivePct);
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
       const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
-      this.agent.injectMessage(handoffPrompt);
+      this.agent.injectMessage(handoffPrompt, 'system');
       this.log(`Handoff prompt injected at ${Math.round(effectivePct)}%`);
       // Pre-arm .force-fresh so the next restart is always a clean fresh session.
       // If the agent cooperates and calls hard-restart, it also writes .force-fresh — no-op.
@@ -1217,7 +1271,9 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       this.saveCtxCircuit();
       const msg = `Context circuit breaker TRIPPED for ${this.agent.name}: 3 restarts in 15min. Watchdog paused 30min. Check logs/${this.agent.name}/restarts.log for details.`;
       this.log(msg);
-      if (this.telegramApi && this.chatId) {
+      if (this.sendService && this.chatId) {
+        this.sendService.sendDirect(this.chatId, msg).catch(() => {});
+      } else if (this.telegramApi && this.chatId) {
         this.telegramApi.sendMessage(this.chatId, msg).catch(() => {});
       }
       return;
@@ -1266,6 +1322,10 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
     this.ctxHandoffDeadlineAt = 0;
     this.ctxWarningFiredAt = 0;
     this.ctxHandoffZeroedAt = 0;
+    // Tier 3 is resolving via force-restart (whether triggered by the deadline or by a
+    // PTY wedge) — clear the persisted armed-state file so it never claims Tier 3 is
+    // still armed once this restart has actually fired.
+    this.clearCtxHandoffDeadline();
 
     // Write .force-fresh + .restart-planned (hardRestart from src/bus/system.ts)
     hardRestart(this.paths, this.agent.name, `CONTEXT-FORCE-RESTART: ${reason}`);
@@ -1356,6 +1416,41 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         restarts: this.ctxCircuitRestarts,
         brokenAt: this.ctxCircuitBrokenAt,
       }), 'utf-8');
+    } catch {
+      // Non-critical
+    }
+  }
+
+  /**
+   * Persist the Tier 3 armed state (ctxHandoffDeadlineAt/ctxHandoffZeroedAt) to a
+   * per-agent file so it is externally readable — an agent (or an outside check) can
+   * poll ctx_handoff_deadline.json to confirm Tier 3 is actually armed for this
+   * session, rather than trusting private in-memory daemon state it has no visibility
+   * into. Call only when ctxHandoffDeadlineAt is a real deadline (> 0).
+   */
+  private persistCtxHandoffDeadline(effectivePct: number): void {
+    try {
+      atomicWriteSync(this.ctxHandoffDeadlineFile, JSON.stringify({
+        armed: true,
+        deadline_at: new Date(this.ctxHandoffDeadlineAt).toISOString(),
+        zeroed_at: this.ctxHandoffZeroedAt > 0 ? new Date(this.ctxHandoffZeroedAt).toISOString() : null,
+        session_id: this.ctxLastSessionId,
+        pct_at_fire: Math.round(effectivePct),
+        written_at: new Date().toISOString(),
+      }, null, 2));
+    } catch {
+      // Non-critical — observability only, must never block the handoff gate itself
+    }
+  }
+
+  /**
+   * Clear the persisted Tier 3 armed-state file. Call whenever ctxHandoffDeadlineAt
+   * is reset to 0 (self-resolved, force-restarted, or a new session was detected) so
+   * the file never claims Tier 3 is armed after it has actually disarmed.
+   */
+  private clearCtxHandoffDeadline(): void {
+    try {
+      if (existsSync(this.ctxHandoffDeadlineFile)) unlinkSync(this.ctxHandoffDeadlineFile);
     } catch {
       // Non-critical
     }

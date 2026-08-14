@@ -182,7 +182,7 @@ describe('Bus System', () => {
       mkdirSync(agentDir, { recursive: true });
 
       const oldDate = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
-      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${oldDate}\n\nSome goal`);
+      writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: oldDate, updated_by: 'tester' }));
 
       const report = checkGoalStaleness(testDir, 7);
       expect(report.summary.total).toBe(1);
@@ -198,7 +198,7 @@ describe('Bus System', () => {
       mkdirSync(agentDir, { recursive: true });
 
       const recentDate = new Date().toISOString();
-      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${recentDate}\n\nSome goal`);
+      writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: recentDate, updated_by: 'tester' }));
 
       const report = checkGoalStaleness(testDir, 7);
       expect(report.summary.fresh).toBe(1);
@@ -206,35 +206,39 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(false);
     });
 
-    it('handles missing GOALS.md', () => {
+    it('marks missing goals.json as VOID and excludes it from scoring', () => {
       const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
       mkdirSync(agentDir, { recursive: true });
-      // No GOALS.md created
+      // No goals.json created
 
       const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('missing');
-      expect(report.agents[0].stale).toBe(true);
-      expect(report.agents[0].reason).toContain('no GOALS.md');
+      expect(report.agents[0].status).toBe('void');
+      expect(report.agents[0].stale).toBeUndefined();
+      expect(report.agents[0].reason).toContain('no goals.json');
+      expect(report.summary.scored).toBe(0);
+      expect(report.summary.void).toBe(1);
     });
 
-    it('handles missing timestamp in GOALS.md', () => {
+    it('marks a missing updated_at as VOID', () => {
       const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
       mkdirSync(agentDir, { recursive: true });
-      writeFileSync(join(agentDir, 'GOALS.md'), '# Goals\n\nJust some text without updated section');
+      writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_by: 'tester' }));
 
       const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('no_timestamp');
-      expect(report.agents[0].stale).toBe(true);
+      expect(report.agents[0].status).toBe('void');
+      expect(report.agents[0].stale).toBeUndefined();
     });
 
-    it('handles unparseable timestamp', () => {
+    it('marks an unparseable updated_at as VOID', () => {
       const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
       mkdirSync(agentDir, { recursive: true });
-      writeFileSync(join(agentDir, 'GOALS.md'), '# Goals\n\n## Updated\nnot-a-date\n');
+      writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: 'not-a-date' }));
 
       const report = checkGoalStaleness(testDir);
-      expect(report.agents[0].status).toBe('parse_error');
-      expect(report.agents[0].stale).toBe(true);
+      expect(report.agents[0].status).toBe('void');
+      expect(report.agents[0].stale).toBeUndefined();
+      expect(report.summary.stale).toBe(0);
+      expect(report.summary.fresh).toBe(0);
     });
 
     it('returns empty report when no orgs directory', () => {
@@ -249,11 +253,65 @@ describe('Bus System', () => {
         const agentDir = join(testDir, 'orgs', org, 'agents', 'bot');
         mkdirSync(agentDir, { recursive: true });
         const date = new Date().toISOString();
-        writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date}\n`);
+        writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: date }));
       }
 
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(2);
+    });
+
+    it('warns when every scored result is the same', () => {
+      for (const agent of ['one', 'two']) {
+        const agentDir = join(testDir, 'orgs', 'myorg', 'agents', agent);
+        mkdirSync(agentDir, { recursive: true });
+        writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: new Date().toISOString() }));
+      }
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.summary.stale).toBe(0);
+      expect(report.summary.fresh).toBe(2);
+      expect(report.summary.saturation_warning).toContain('saturated');
+    });
+
+    it('does not warn when the scored results discriminate', () => {
+      const dates = [
+        new Date().toISOString(),
+        new Date(Date.now() - 10 * 86400 * 1000).toISOString(),
+      ];
+      for (const [index, date] of dates.entries()) {
+        const agentDir = join(testDir, 'orgs', 'myorg', 'agents', `worker${index}`);
+        mkdirSync(agentDir, { recursive: true });
+        writeFileSync(join(agentDir, 'goals.json'), JSON.stringify({ updated_at: date }));
+      }
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.summary.stale).toBe(1);
+      expect(report.summary.fresh).toBe(1);
+      expect(report.summary.saturation_warning).toBeUndefined();
+    });
+
+    it('changes the same agent from fresh to stale when only updated_at changes', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+      const goalsPath = join(agentDir, 'goals.json');
+      const fixedState = {
+        focus: 'unchanged',
+        goals: ['unchanged'],
+        updated_at: new Date().toISOString(),
+        updated_by: 'tester',
+      };
+      writeFileSync(goalsPath, JSON.stringify(fixedState));
+
+      const freshReport = checkGoalStaleness(testDir, 7);
+      expect(freshReport.agents[0].status).toBe('fresh');
+
+      writeFileSync(goalsPath, JSON.stringify({
+        ...fixedState,
+        updated_at: new Date(Date.now() - 10 * 86400 * 1000).toISOString(),
+      }));
+      const staleReport = checkGoalStaleness(testDir, 7);
+      expect(staleReport.agents[0].status).toBe('stale');
+      expect(staleReport.agents[0].updated_by).toBe('tester');
     });
   });
 

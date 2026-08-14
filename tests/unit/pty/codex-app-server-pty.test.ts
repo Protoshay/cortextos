@@ -64,6 +64,16 @@ vi.mock('../../../src/bus/event.js', () => ({
   logEvent: logEventMock,
 }));
 
+// replyLocal routes through IPC (not the TelegramAPI handle) so we mock
+// IPCClient to capture those send calls in tests that bind a Telegram handle.
+const ipcSendMock = vi.fn().mockResolvedValue({ ok: true });
+vi.mock('../../../src/daemon/ipc-server.js', () => ({
+  IPCClient: class {
+    constructor(_instanceId: string) {}
+    send(...args: unknown[]) { return ipcSendMock(...args); }
+  },
+}));
+
 const { CodexAppServerPTY } = await import('../../../src/pty/codex-app-server-pty.js');
 
 const mockEnv = {
@@ -88,6 +98,7 @@ beforeEach(() => {
   respondErrorMock.mockReset();
   logEventMock.mockReset();
   atomicWriteSyncMock.mockReset();
+  ipcSendMock.mockReset().mockResolvedValue({ ok: true });
   messageHandler = null;
 });
 
@@ -198,51 +209,58 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
   it('mirrors /goal get reply to Telegram when handle is bound', async () => {
     requestMock.mockResolvedValue({ result: { goal: null } });
     const pty = makeReadyPty();
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    pty.setTelegramHandle({ sendMessage } as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
+    pty.setTelegramHandle({} as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
     pty.write('/goal');
     pty.write('\r');
     await Promise.resolve();
-    expect(sendMessage).toHaveBeenCalledWith('7940429114', '[goal] none set', undefined, { parseMode: null });
+    // replyLocal routes through IPC (daemon-owned token), not the legacy Telegram handle
+    expect(ipcSendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'send-human-message',
+      data: expect.objectContaining({ chatId: '7940429114', text: '[goal] none set' }),
+    }));
   });
 
   it('mirrors /goal set reply to Telegram when handle is bound', async () => {
     requestMock.mockResolvedValue({ result: { goal: { status: 'active' } } });
     const pty = makeReadyPty();
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    pty.setTelegramHandle({ sendMessage } as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
+    pty.setTelegramHandle({} as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
     pty.write('/goal Ship native slash routing');
     pty.write('\r');
     await Promise.resolve();
-    expect(sendMessage).toHaveBeenCalledWith('7940429114', '[goal] active: Ship native slash routing', undefined, { parseMode: null });
+    expect(ipcSendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'send-human-message',
+      data: expect.objectContaining({ chatId: '7940429114', text: '[goal] active: Ship native slash routing' }),
+    }));
   });
 
   it('mirrors /goal clear reply to Telegram when handle is bound', async () => {
     requestMock.mockResolvedValue({ result: { cleared: true } });
     const pty = makeReadyPty();
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    pty.setTelegramHandle({ sendMessage } as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
+    pty.setTelegramHandle({} as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
     pty.write('/goal clear');
     pty.write('\r');
     await Promise.resolve();
-    expect(sendMessage).toHaveBeenCalledWith('7940429114', '[goal] cleared', undefined, { parseMode: null });
+    expect(ipcSendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'send-human-message',
+      data: expect.objectContaining({ chatId: '7940429114', text: '[goal] cleared' }),
+    }));
   });
 
   it('mirrors unknown $skill error to Telegram when handle is bound', async () => {
     requestMock.mockResolvedValue({ result: { data: [{ cwd: '/tmp', skills: [{ name: 'imagegen', path: '/skill.md', enabled: true }] }] } });
     const pty = makeReadyPty();
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    pty.setTelegramHandle({ sendMessage } as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
+    pty.setTelegramHandle({} as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
     pty.write('$nonexistent_skill');
     pty.write('\r');
     await Promise.resolve();
     await Promise.resolve();
-    expect(sendMessage).toHaveBeenCalledWith(
-      '7940429114',
-      '[skill] unknown "nonexistent_skill". No enabled matches found.',
-      undefined,
-      { parseMode: null },
-    );
+    expect(ipcSendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'send-human-message',
+      data: expect.objectContaining({
+        chatId: '7940429114',
+        text: '[skill] unknown "nonexistent_skill". No enabled matches found.',
+      }),
+    }));
   });
 
   it('does not fall back to text for unknown skills', async () => {
@@ -367,18 +385,18 @@ Reply using: cortextos bus send-telegram 7940429114 '<your reply>'
       result: { data: [{ cwd: '/tmp', skills: [{ name: 'heartbeat', path: '/h.md', enabled: true }] }] },
     });
     const pty = makeReadyPty();
-    const sendMessage = vi.fn().mockResolvedValue(undefined);
-    pty.setTelegramHandle({ sendMessage } as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
+    pty.setTelegramHandle({} as unknown as Parameters<typeof pty.setTelegramHandle>[0], '7940429114');
     pty.write('/notaskill');
     pty.write('\r');
     await Promise.resolve();
     await Promise.resolve();
-    expect(sendMessage).toHaveBeenCalledWith(
-      '7940429114',
-      '[skill] unknown "notaskill". No enabled matches found.',
-      undefined,
-      { parseMode: null },
-    );
+    expect(ipcSendMock).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'send-human-message',
+      data: expect.objectContaining({
+        chatId: '7940429114',
+        text: '[skill] unknown "notaskill". No enabled matches found.',
+      }),
+    }));
     expect(requestMock).not.toHaveBeenCalledWith('turn/start', expect.anything());
   });
 

@@ -4,7 +4,34 @@ import { readdirSync, readFileSync, writeFileSync, existsSync, chmodSync } from 
 import { spawnSync } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
+import { format } from 'util';
 import { ensureDir } from '../utils/atomic.js';
+
+type ConsoleMethod = (...args: unknown[]) => void;
+
+/** Format every physical daemon log line with an attributable UTC timestamp. */
+export function timestampDaemonLogLines(args: unknown[], now: () => Date = () => new Date()): string[] {
+  const rendered = format(...args);
+  return rendered.split('\n').map(line => `${now().toISOString()} ${line}`);
+}
+
+/**
+ * Install once at daemon startup so loggers in every daemon subsystem inherit
+ * the same timestamp format without each call site having to remember it.
+ */
+export function installDaemonConsoleTimestamps(now: () => Date = () => new Date()): void {
+  const marker = '__cortextosTimestamped';
+  const wrappedConsole = console as typeof console & Record<string, unknown>;
+  if (wrappedConsole[marker]) return;
+
+  for (const method of ['log', 'info', 'warn', 'error'] as const) {
+    const original = console[method].bind(console) as ConsoleMethod;
+    console[method] = ((...args: unknown[]) => {
+      for (const line of timestampDaemonLogLines(args, now)) original(line);
+    }) as typeof console[typeof method];
+  }
+  wrappedConsole[marker] = true;
+}
 
 // Each fast-checker registers a process-level SIGUSR1 handler (see
 // fast-checker.ts:102). With >10 active agents the default Node listener cap
@@ -230,6 +257,8 @@ class Daemon {
   }
 
   async start(): Promise<void> {
+    installDaemonConsoleTimestamps();
+
     // Force restrictive default permissions for everything the daemon writes:
     // 0700 dirs, 0600 files. Belt-and-suspenders for explicit chmod calls.
     if (process.platform !== 'win32') {

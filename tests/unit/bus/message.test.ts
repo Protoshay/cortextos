@@ -150,13 +150,26 @@ describe('Message Bus', () => {
       const msgId = sendMessage(senderPaths, 'sender', 'receiver', 'normal', 'test');
       checkInbox(receiverPaths); // moves to inflight
 
-      ackInbox(receiverPaths, msgId);
+      expect(ackInbox(receiverPaths, msgId)).toBe(true);
 
       const inflightFiles = readdirSync(receiverPaths.inflight).filter(f => f.endsWith('.json'));
       const processedFiles = readdirSync(receiverPaths.processed).filter(f => f.endsWith('.json'));
 
       expect(inflightFiles.length).toBe(0);
       expect(processedFiles.length).toBe(1);
+    });
+
+    it('returns false when the message is not in inflight', () => {
+      expect(ackInbox(receiverPaths, 'not-a-real-message-id')).toBe(false);
+
+      const processedFiles = readdirSync(receiverPaths.processed).filter(f => f.endsWith('.json'));
+      expect(processedFiles).toEqual([]);
+    });
+
+    it('returns false when the inflight directory is unavailable', () => {
+      rmSync(receiverPaths.inflight, { recursive: true, force: true });
+
+      expect(ackInbox(receiverPaths, 'not-a-real-message-id')).toBe(false);
     });
   });
 

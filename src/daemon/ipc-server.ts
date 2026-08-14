@@ -3,6 +3,7 @@ import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
+import type { HumanSendRequest } from './telegram-send-service.js';
 import { getIpcPath } from '../utils/paths.js';
 import { readCrons, getExecutionLog, getExecutionLogPage, addCron, updateCron, removeCron, getCronByName } from '../bus/crons.js';
 import type { ExecutionLogStatusFilter } from '../bus/crons.js';
@@ -506,7 +507,20 @@ export class IPCServer {
           try {
             const request: IPCRequest = JSON.parse(data);
             data = '';
-            this.handleRequest(request, socket);
+            // handleRequest is async for 'send-human-message'; fire and
+            // handle errors internally so an uncaught rejection doesn't
+            // crash the server.
+            this.handleRequest(request, socket).catch((err) => {
+              console.error('[ipc] handleRequest uncaught error:', err);
+              try {
+                socket.write(
+                  JSON.stringify({ success: false, error: String(err) }),
+                );
+                socket.end();
+              } catch {
+                /* client disconnected */
+              }
+            });
           } catch {
             // Incomplete JSON, wait for more data
           }
@@ -566,8 +580,9 @@ export class IPCServer {
 
   /**
    * Handle an incoming IPC request.
+   * Async to support the 'send-human-message' handler which awaits the checker.
    */
-  private handleRequest(request: IPCRequest, socket: Socket): void {
+  private async handleRequest(request: IPCRequest, socket: Socket): Promise<void> {
     // BUG-015: log every incoming IPC request with its source so we can
     // trace which CLI command triggered which daemon action. The source
     // field is populated by CLI clients (cortextos enable / disable / stop
@@ -664,6 +679,8 @@ export class IPCServer {
             response = { success: false, error: 'spawn-worker requires: name, dir, prompt' };
           } else if (!WORKER_NAME_REGEX.test(d.name) || d.name.length > 64) {
             response = { success: false, error: 'Invalid worker name' };
+          } else if (!this.agentManager.isAutonomousWorkAllowed()) {
+            response = { success: false, error: 'Working-hours gate: worker spawn blocked outside Europe/London weekday 07:00-19:00' };
           } else {
             const resolvedDir = pathResolve(d.dir);
             const ctxRoot = process.env.CTX_ROOT ? pathResolve(process.env.CTX_ROOT) : '';
@@ -839,6 +856,97 @@ export class IPCServer {
           break;
         }
 
+        case 'send-human-message': {
+          const d = request.data as {
+            chatId?: string;
+            text?: string;
+            deliverableForMsgId?: number;
+            correctionOf?: number;
+            image?: string;
+            file?: string;
+            plainText?: boolean;
+            replyMarkup?: object;
+            source?: string;
+            /** Amendment: gate human-facing edits through the checker. */
+            edit?: boolean;
+            editMessageId?: number;
+          } | undefined;
+
+          if (!request.agent || !d?.chatId || !d?.text) {
+            response = {
+              success: false,
+              error: 'send-human-message requires: agent, data.chatId, data.text',
+            };
+            break;
+          }
+
+          const svc = this.agentManager.getTelegramSendService(request.agent);
+          if (!svc) {
+            response = {
+              success: false,
+              error: `Agent '${request.agent}' has no active send service`,
+            };
+            break;
+          }
+
+          const source: HumanSendRequest['source'] =
+            d.source === 'hook' ? 'hook' : 'cli';
+
+          // Await is safe: handleSendRequest is bounded by checkerConfig.timeoutMs (8 s)
+          // plus Telegram API timeout (15 s). IPC client uses 35 s for this command type.
+          const result = await svc.handleSendRequest({
+            agentName: request.agent,
+            chatId: d.chatId,
+            text: d.text,
+            deliverableForMsgId:
+              typeof d.deliverableForMsgId === 'number'
+                ? d.deliverableForMsgId
+                : undefined,
+            correctionOf:
+              typeof d.correctionOf === 'number' ? d.correctionOf : undefined,
+            image: typeof d.image === 'string' ? d.image : undefined,
+            file: typeof d.file === 'string' ? d.file : undefined,
+            plainText: d.plainText === true,
+            replyMarkup: d.replyMarkup,
+            source,
+            edit: d.edit === true,
+            editMessageId:
+              typeof d.editMessageId === 'number' ? d.editMessageId : undefined,
+          });
+
+          response = result.ok
+            ? { success: true, data: { sentMessageId: result.sentMessageId } }
+            : {
+                success: false,
+                error:
+                  result.rejection?.reason ?? result.error ?? 'Send rejected',
+                data: { rewrite: result.rejection?.rewrite },
+              };
+          break;
+        }
+
+        case 'send-activity-message': {
+          // Amendment: gate activity-channel messages through the daemon.
+          // Routes through AgentManager which holds the activityApi for the orchestrator.
+          const d = request.data as {
+            org?: string;
+            text?: string;
+            replyMarkup?: object;
+          } | undefined;
+          if (!d?.org || !d?.text) {
+            response = {
+              success: false,
+              error: 'send-activity-message requires: data.org, data.text',
+            };
+            break;
+          }
+          const sent = await this.agentManager.sendActivityMessage(d.org, d.text, d.replyMarkup);
+          response = sent
+            ? { success: true }
+            : { success: false, error: `Activity channel not configured for org '${d.org}'` };
+          break;
+        }
+
         default:
           response = { success: false, error: `Unknown command: ${request.type}` };
       }
@@ -868,9 +976,15 @@ export class IPCClient {
 
   /**
    * Send a command to the daemon and get the response.
+   *
+   * The 'send-human-message' command uses a 35 s timeout (8 s checker +
+   * 15 s Telegram API + buffer). All other commands use the default 5 s.
    */
   async send(request: IPCRequest): Promise<IPCResponse> {
     const { createConnection } = require('net');
+
+    // 'send-human-message' is bounded by checker (8 s) + Telegram API (15 s)
+    const timeoutMs = request.type === 'send-human-message' ? 35_000 : 5_000;
 
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.socketPath, () => {
@@ -901,8 +1015,7 @@ export class IPCClient {
         }
       });
 
-      // Timeout after 5 seconds
-      socket.setTimeout(5000, () => {
+      socket.setTimeout(timeoutMs, () => {
         socket.destroy();
         reject(new Error('IPC request timed out'));
       });

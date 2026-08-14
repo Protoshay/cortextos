@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { TelegramAPI } from '../../../src/telegram/api';
+import { requireSentMessageId, TelegramAPI } from '../../../src/telegram/api';
 
 // Shared fetch-stub infrastructure. Each test queues responses; the stub
 // records call details so we can assert on payload shapes and call counts.
@@ -47,6 +47,23 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   console.warn = originalWarn;
+});
+
+describe('requireSentMessageId', () => {
+  it('returns a valid Telegram message id', () => {
+    expect(requireSentMessageId({ ok: true, result: { message_id: 42 } })).toBe(42);
+  });
+
+  it.each([
+    { ok: true },
+    { ok: true, result: {} },
+    { ok: true, result: { message_id: 0 } },
+    { ok: true, result: { message_id: '42' } },
+  ])('rejects an unrecognised successful response envelope', (response) => {
+    expect(() => requireSentMessageId(response)).toThrow(
+      'Telegram API returned success without a valid message_id',
+    );
+  });
 });
 
 describe('TelegramAPI.sendMessage HTML mode', () => {

@@ -6,7 +6,7 @@
  * Timeout: 1800s (30 min, deny by default).
  */
 
-import { TelegramAPI } from '../telegram/api';
+import { IPCClient } from '../daemon/ipc-server';
 import {
   readStdin,
   parseHookInput,
@@ -68,10 +68,25 @@ async function main(): Promise<void> {
   }
 
   const keyboard = buildPermissionKeyboard(uniqueId);
-  const api = new TelegramAPI(env.botToken);
 
   try {
-    await api.sendMessage(env.chatId, message, keyboard);
+    const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+    const ipc = new IPCClient(instanceId);
+    const resp = await ipc.send({
+      type: 'send-human-message',
+      agent: env.agentName,
+      source: 'hook-permission-telegram',
+      data: {
+        chatId: env.chatId,
+        text: message,
+        replyMarkup: keyboard,
+        source: 'hook',
+      },
+    });
+    if (!resp.success) {
+      outputDecision('deny', 'Failed to send permission request to Telegram');
+      return;
+    }
   } catch {
     outputDecision('deny', 'Failed to send permission request to Telegram');
     return;
@@ -96,10 +111,18 @@ async function main(): Promise<void> {
   } else {
     // Timeout - deny and notify
     try {
-      await api.sendMessage(
-        env.chatId,
-        `Permission request TIMED OUT (auto-denied): ${tool_name}`,
-      );
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const ipc = new IPCClient(instanceId);
+      await ipc.send({
+        type: 'send-human-message',
+        agent: env.agentName,
+        source: 'hook-permission-telegram',
+        data: {
+          chatId: env.chatId,
+          text: `Permission request TIMED OUT (auto-denied): ${tool_name}`,
+          source: 'hook',
+        },
+      });
     } catch {
       // Ignore notification failure
     }

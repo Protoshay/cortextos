@@ -3,7 +3,7 @@ import { existsSync, readFileSync, statSync, appendFileSync, writeFileSync } fro
 import { join, extname } from 'path';
 import { readdirSync } from 'fs';
 import { ensureDir } from '../utils/atomic.js';
-import { TelegramAPI } from '../telegram/api.js';
+import { IPCClient } from '../daemon/ipc-server.js';
 import type { BusPaths } from '../types/index.js';
 
 // --- Types ---
@@ -18,15 +18,27 @@ export interface AutoCommitReport {
 export interface AgentGoalStatus {
   agent: string;
   org: string;
-  status: 'fresh' | 'stale' | 'missing' | 'no_timestamp' | 'parse_error';
+  status: 'fresh' | 'stale' | 'void';
   updated?: string;
+  updated_by?: string;
   age_days?: number;
-  stale: boolean;
+  // VOID deliberately has no boolean verdict. Current consumers branch on
+  // `status`; a future consumer must not use `!stale`, which would fold VOID
+  // into fresh. Re-audit consumers before widening this interface.
+  stale?: boolean;
   reason?: string;
 }
 
 export interface GoalStalenessReport {
-  summary: { total: number; stale: number; fresh: number; threshold_days: number };
+  summary: {
+    total: number;
+    scored: number;
+    stale: number;
+    fresh: number;
+    void: number;
+    threshold_days: number;
+    saturation_warning?: string;
+  };
   agents: AgentGoalStatus[];
 }
 
@@ -232,7 +244,7 @@ export function checkGoalStaleness(
   const orgsDir = join(projectRoot, 'orgs');
   if (!existsSync(orgsDir)) {
     return {
-      summary: { total: 0, stale: 0, fresh: 0, threshold_days: thresholdDays },
+      summary: { total: 0, scored: 0, stale: 0, fresh: 0, void: 0, threshold_days: thresholdDays },
       agents: [],
     };
   }
@@ -270,72 +282,53 @@ export function checkGoalStaleness(
     }
 
     for (const agentName of agentNames) {
-      const goalsFile = join(agentsDir, agentName, 'GOALS.md');
+      const goalsFile = join(agentsDir, agentName, 'goals.json');
 
       if (!existsSync(goalsFile)) {
         agents.push({
           agent: agentName,
           org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'no GOALS.md file',
+          status: 'void',
+          reason: 'no goals.json file',
         });
         continue;
       }
 
-      // Read and parse GOALS.md
-      let content: string;
+      let goalState: { updated_at?: unknown; updated_by?: unknown };
       try {
-        content = readFileSync(goalsFile, 'utf-8');
+        goalState = JSON.parse(readFileSync(goalsFile, 'utf-8')) as {
+          updated_at?: unknown;
+          updated_by?: unknown;
+        };
       } catch {
         agents.push({
           agent: agentName,
           org: orgName,
-          status: 'missing',
-          stale: true,
-          reason: 'could not read GOALS.md',
+          status: 'void',
+          reason: 'could not read or parse goals.json',
         });
         continue;
       }
 
-      // Find "## Updated" section and get the next line
-      const lines = content.split('\n');
-      let updatedLine: string | null = null;
-      for (let i = 0; i < lines.length; i++) {
-        if (lines[i].trim().startsWith('## Updated')) {
-          // Get next non-empty line
-          for (let j = i + 1; j < lines.length; j++) {
-            const trimmed = lines[j].trim();
-            if (trimmed && !trimmed.startsWith('##')) {
-              updatedLine = trimmed;
-              break;
-            }
-          }
-          break;
-        }
-      }
-
-      if (!updatedLine) {
+      if (typeof goalState.updated_at !== 'string' || !goalState.updated_at.trim()) {
         agents.push({
           agent: agentName,
           org: orgName,
-          status: 'no_timestamp',
-          stale: true,
-          reason: 'no Updated timestamp in GOALS.md',
+          status: 'void',
+          reason: 'goals.json has no string updated_at',
         });
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      const updatedAt = goalState.updated_at;
+      const parsedDate = new Date(updatedAt);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,
           org: orgName,
-          status: 'parse_error',
-          updated: updatedLine,
-          stale: true,
-          reason: 'could not parse timestamp',
+          status: 'void',
+          updated: updatedAt,
+          reason: 'could not parse goals.json updated_at',
         });
         continue;
       }
@@ -348,7 +341,8 @@ export function checkGoalStaleness(
         agent: agentName,
         org: orgName,
         status: isStale ? 'stale' : 'fresh',
-        updated: updatedLine,
+        updated: updatedAt,
+        updated_by: typeof goalState.updated_by === 'string' ? goalState.updated_by : undefined,
         age_days: ageDays,
         stale: isStale,
         reason: isStale
@@ -359,15 +353,23 @@ export function checkGoalStaleness(
   }
 
   const total = agents.length;
-  const staleCount = agents.filter(a => a.stale).length;
-  const freshCount = agents.filter(a => !a.stale).length;
+  const staleCount = agents.filter(a => a.status === 'stale').length;
+  const freshCount = agents.filter(a => a.status === 'fresh').length;
+  const voidCount = agents.filter(a => a.status === 'void').length;
+  const scored = staleCount + freshCount;
+  const saturationWarning = scored > 0 && (staleCount === 0 || freshCount === 0)
+    ? `Instrument warning: scored output is saturated (${staleCount} stale, ${freshCount} fresh). Treat as non-discriminating until independently controlled.`
+    : undefined;
 
   return {
     summary: {
       total,
+      scored,
       stale: staleCount,
       fresh: freshCount,
+      void: voidCount,
       threshold_days: thresholdDays,
+      saturation_warning: saturationWarning,
     },
     agents,
   };
@@ -394,52 +396,22 @@ export async function postActivity(
   message: string,
   replyMarkup?: object,
 ): Promise<boolean> {
-  // Look for activity-channel.env
-  const candidates = [
-    join(orgDir, 'activity-channel.env'),
-    join(ctxRoot, 'orgs', org, 'activity-channel.env'),
-  ];
-
-  let configPath: string | null = null;
-  for (const candidate of candidates) {
-    if (existsSync(candidate)) {
-      configPath = candidate;
-      break;
-    }
-  }
-
-  if (!configPath) {
-    return false;
-  }
-
-  // Parse the env file
-  let botToken: string | undefined;
-  let chatId: string | undefined;
-
+  // Amendment: gate activity-channel sends through the daemon's IPC.
+  // The daemon owns the ACTIVITY_BOT_TOKEN and routes via its daemon-held
+  // activityApi (set up in maybeStartActivityChannelPoller). This removes
+  // the direct TelegramAPI call from this module.
+  // Falls back to false on daemon-unavailable — same best-effort contract as before.
+  // orgDir and ctxRoot retained in the signature for backward compatibility
+  // with existing callers; they are no longer used in this function body.
+  void orgDir; void ctxRoot;
   try {
-    const content = readFileSync(configPath, 'utf-8');
-    for (const line of content.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const eqIdx = trimmed.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = trimmed.slice(0, eqIdx).trim();
-      const value = trimmed.slice(eqIdx + 1).trim();
-      if (key === 'ACTIVITY_BOT_TOKEN') botToken = value;
-      if (key === 'ACTIVITY_CHAT_ID') chatId = value;
-    }
-  } catch {
-    return false;
-  }
-
-  if (!botToken || !chatId) {
-    return false;
-  }
-
-  try {
-    const api = new TelegramAPI(botToken);
-    await api.sendMessage(chatId, message, replyMarkup);
-    return true;
+    const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+    const ipc = new IPCClient(instanceId);
+    const resp = await ipc.send({
+      type: 'send-activity-message',
+      data: { org, text: message, replyMarkup },
+    });
+    return resp.success;
   } catch {
     return false;
   }

@@ -10,18 +10,12 @@ vi.mock('../../../src/bus/message', () => ({
   sendMessage: vi.fn(),
 }));
 
-// Mock TelegramAPI so the agent-bot ping is observable without hitting the
-// network. Constructor records the bot token; sendMessage records its call.
-const telegramSendMessageSpy = vi.fn().mockResolvedValue({ result: { message_id: 1 } });
-const telegramConstructorSpy = vi.fn();
-vi.mock('../../../src/telegram/api', () => ({
-  TelegramAPI: class {
-    constructor(token: string) {
-      telegramConstructorSpy(token);
-    }
-    sendMessage(...args: unknown[]) {
-      return telegramSendMessageSpy(...args);
-    }
+// Mock IPCClient so the agent-bot ping (now routed via IPC) is observable
+// without hitting the daemon socket.
+const ipcSendSpy = vi.fn().mockResolvedValue({ success: true });
+vi.mock('../../../src/daemon/ipc-server', () => ({
+  IPCClient: class {
+    send(...args: unknown[]) { return ipcSendSpy(...args); }
   },
 }));
 
@@ -61,9 +55,8 @@ beforeEach(() => {
   paths = mkPaths(testDir);
   postActivitySpy.mockClear();
   postActivitySpy.mockResolvedValue(true);
-  telegramSendMessageSpy.mockClear();
-  telegramSendMessageSpy.mockResolvedValue({ result: { message_id: 1 } });
-  telegramConstructorSpy.mockClear();
+  ipcSendSpy.mockClear();
+  ipcSendSpy.mockResolvedValue({ success: true });
   delete process.env.CTX_FRAMEWORK_ROOT;
 });
 
@@ -277,23 +270,17 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
       agentDir,
     );
 
-    expect(telegramConstructorSpy).toHaveBeenCalledWith('test-token-123');
-    expect(telegramSendMessageSpy).toHaveBeenCalledTimes(1);
-    const [chatId, message, , opts] = telegramSendMessageSpy.mock.calls[0] as [
-      string,
-      string,
-      unknown,
-      { parseMode: string | null },
-    ];
-    expect(chatId).toBe('987654321');
-    expect(String(message)).toContain('Deploy to prod');
-    expect(String(message)).toContain('deployment');
-    expect(String(message)).toContain('alice');
-    expect(String(message)).toContain(id);
-    expect(String(message)).toContain('rationale here');
-    // Plain text — must NOT trip Telegram's HTML/Markdown parser on
-    // arbitrary approval titles. parseMode: null sends as plain text.
-    expect(opts.parseMode).toBeNull();
+    expect(ipcSendSpy).toHaveBeenCalledTimes(1);
+    const req = ipcSendSpy.mock.calls[0][0] as any;
+    expect(req.data.chatId).toBe('987654321');
+    const text = String(req.data.text);
+    expect(text).toContain('Deploy to prod');
+    expect(text).toContain('deployment');
+    expect(text).toContain('alice');
+    expect(text).toContain(id);
+    expect(text).toContain('rationale here');
+    // plainText: true ensures no HTML/Markdown parser trips on arbitrary titles
+    expect(req.data.plainText).toBe(true);
   });
 
   it('skips with a warn when agentDir is not provided', async () => {
@@ -301,7 +288,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'No agentDir', 'deployment', undefined, frameworkRoot);
 
-    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    expect(ipcSendSpy).not.toHaveBeenCalled();
     const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
     expect(warnCalls.some((w) => w.includes('[approval]') && w.includes('No agentDir') && w.includes(id))).toBe(true);
     warnSpy.mockRestore();
@@ -317,7 +304,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 
     await createApproval(paths, 'alice', 'TestOrg', 'No env', 'deployment', undefined, frameworkRoot, agentDir);
 
-    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    expect(ipcSendSpy).not.toHaveBeenCalled();
     // No agent-bot warn for this case (the missing-keys case below DOES warn).
     const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
     expect(warnCalls.some((w) => w.includes('agent-bot Telegram ping') || w.includes('BOT_TOKEN or CHAT_ID missing'))).toBe(
@@ -333,7 +320,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Missing token', 'deployment', undefined, frameworkRoot, agentDir);
 
-    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    expect(ipcSendSpy).not.toHaveBeenCalled();
     const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
     expect(warnCalls.some((w) => w.includes('BOT_TOKEN or CHAT_ID missing') && w.includes(id))).toBe(true);
     warnSpy.mockRestore();
@@ -346,7 +333,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Missing chat', 'deployment', undefined, frameworkRoot, agentDir);
 
-    expect(telegramSendMessageSpy).not.toHaveBeenCalled();
+    expect(ipcSendSpy).not.toHaveBeenCalled();
     const warnCalls = warnSpy.mock.calls.map((c) => c.join(' '));
     expect(warnCalls.some((w) => w.includes('BOT_TOKEN or CHAT_ID missing') && w.includes(id))).toBe(true);
     warnSpy.mockRestore();
@@ -357,7 +344,7 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
     // channel is best-effort, so is the agent-bot ping.
     const agentDir = join(testDir, 'agent-tg-down');
     writeAgentEnv(agentDir, { BOT_TOKEN: 'test-token-123', CHAT_ID: '987654321' });
-    telegramSendMessageSpy.mockRejectedValueOnce(new Error('telegram unreachable'));
+    ipcSendSpy.mockRejectedValueOnce(new Error('telegram unreachable'));
 
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Telegram down', 'deployment', undefined, frameworkRoot, agentDir);
 
@@ -380,8 +367,8 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
       agentDir,
     );
 
-    const [, message] = telegramSendMessageSpy.mock.calls[0] as [string, string, unknown, unknown];
-    const text = String(message);
+    const req2 = ipcSendSpy.mock.calls[0][0] as any;
+    const text = String(req2.data.text);
     expect(text).toContain('Body shape test');
     expect(text).toContain('other');
     expect(text).toContain('bob');

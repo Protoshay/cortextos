@@ -22,8 +22,8 @@ import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, 
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
-import { TelegramAPI } from '../telegram/api.js';
-import { logOutboundMessage, cacheLastSent, checkHumanConversationGate, checkHumanQuestionGate, markHumanQuestionOpen } from '../telegram/logging.js';
+import { requireSentMessageId, TelegramAPI } from '../telegram/api.js';
+import { logOutboundMessage, cacheLastSent, checkHumanConversationGate, checkHumanMessageCadenceGate, checkHumanQuestionGate, markHumanQuestionOpen } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
 
 /**
@@ -137,7 +137,12 @@ busCommand
   .action((id: string) => {
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    ackInbox(paths, id);
+    const acknowledged = ackInbox(paths, id);
+    if (!acknowledged) {
+      console.error(`Message ${id} was not found in inflight; nothing was acknowledged.`);
+      process.exitCode = 1;
+      return;
+    }
     try {
       logEvent(paths, env.agentName, env.org, 'message', 'inbox_ack', 'info', JSON.stringify({ msg_id: id }));
     } catch { /* non-fatal */ }
@@ -181,13 +186,28 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled). Omit to keep current status while updating --desc.')
-  .option('--desc <text>', 'Update task description')
-  .action((id: string, status: string | undefined, opts: { desc?: string }) => {
+  .option('--desc <text>', 'Append text to the task description')
+  .option('--replace-desc', 'Replace the task description instead of appending (requires --desc)', false)
+  .action((id: string, status: string | undefined, opts: { desc?: string; replaceDesc?: boolean }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
 
     let resolvedStatus: TaskStatus;
+    let currentTask: Task | undefined;
+    let descriptionUpdate: string | undefined;
+    if (opts.replaceDesc && opts.desc === undefined) {
+      console.error('--replace-desc requires --desc.');
+      process.exit(1);
+    }
+    if (opts.desc !== undefined || status === undefined) {
+      const filePath = findTaskFile(paths, id);
+      if (!filePath) {
+        console.error(`Task ${id} not found in any org under ${paths.ctxRoot}/orgs/`);
+        process.exit(1);
+      }
+      currentTask = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    }
     if (status === undefined) {
       // Desc-only update: status wasn't a real optional argument before, so
       // `update-task <id> --desc "..."` errored on a missing positional arg
@@ -197,12 +217,7 @@ busCommand
         console.error('Nothing to update: provide a status, --desc, or both.');
         process.exit(1);
       }
-      const filePath = findTaskFile(paths, id);
-      if (!filePath) {
-        console.error(`Task ${id} not found in any org under ${paths.ctxRoot}/orgs/`);
-        process.exit(1);
-      }
-      resolvedStatus = (JSON.parse(readFileSync(filePath, 'utf-8')) as Task).status;
+      resolvedStatus = currentTask!.status;
     } else {
       if (!validStatuses.includes(status as TaskStatus)) {
         console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -214,7 +229,10 @@ busCommand
     // Guard: block review/completion when deliverables are required but missing.
     // Checks both ready_for_review (approval workflow) and completed (vanilla upstream)
     // so the validator works regardless of which status set is installed.
-    if ((resolvedStatus === 'ready_for_review' || resolvedStatus === 'completed') && env.org) {
+    // Compared through `string` on purpose: TaskStatus varies between installs, so the
+    // compiler cannot see 'ready_for_review' as reachable here. Do not remove the widening
+    // and do not delete the disjunct — that silently drops the approval-workflow guard.
+    if (((resolvedStatus as string) === 'ready_for_review' || resolvedStatus === 'completed') && env.org) {
       const err = checkDeliverableRequirement(id, env.frameworkRoot, env.org, paths.taskDir);
       if (err) {
         console.error(err);
@@ -222,7 +240,15 @@ busCommand
       }
     }
 
-    updateTask(paths, id, resolvedStatus, opts.desc);
+    if (opts.desc !== undefined) {
+      const before = currentTask!.description ?? '';
+      descriptionUpdate = opts.replaceDesc || before.length === 0
+        ? opts.desc
+        : `${before}\n\n${opts.desc}`;
+      console.log(`Description ${opts.replaceDesc ? 'replaced' : 'appended'}: ${before.length} -> ${descriptionUpdate.length} chars`);
+    }
+
+    updateTask(paths, id, resolvedStatus, descriptionUpdate);
     console.log(`Updated ${id} -> ${resolvedStatus}`);
   });
 
@@ -399,7 +425,7 @@ busCommand
     const STATUS_ICON: Record<string, string> = { pending: '○', in_progress: '●', blocked: '◑', completed: '✓', done: '✓', cancelled: '✗' };
 
     console.log(`\n  Tasks (${tasks.length})\n`);
-    const header = '  Status  Pri  ID                        Assignee         Title';
+    const header = '  Status  Pri  ID                          Assignee         Title';
     const separator = '  ' + '-'.repeat(header.length - 2);
     console.log(header);
     console.log(separator);
@@ -407,9 +433,11 @@ busCommand
     for (const t of tasks) {
       const statusIcon = (STATUS_ICON[t.status] || '?').padEnd(8);
       const priIcon = (PRIORITY_ICON[t.priority] || '·').padEnd(5);
-      const id = t.id.substring(0, 26).padEnd(26);
+      const id = t.id.substring(0, 27).padEnd(28);
       const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
-      const title = t.title.substring(0, 50);
+      const title = t.title.length > 50
+        ? `${t.title.substring(0, 49)}…`
+        : t.title;
       console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
     }
     console.log('');
@@ -721,12 +749,12 @@ busCommand
 
 busCommand
   .command('check-goal-staleness')
-  .description('Detect agents with stale GOALS.md')
+  .description('Detect agents with stale goals.json state')
   .option('--threshold <days>', 'Staleness threshold in days', '7')
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    const report = checkGoalStaleness(projectRoot, Number(opts.threshold));
     console.log(JSON.stringify(report, null, 2));
   });
 
@@ -997,106 +1025,71 @@ busCommand
 
 busCommand
   .command('send-telegram')
-  .description('Send a message to a Telegram chat')
+  .description('Send a message to a Telegram chat (routed through daemon message checker)')
   .argument('<chat-id>', 'Telegram chat ID')
   .argument('<message>', 'Message text (supports Telegram Markdown unless --plain-text is set)')
   .option('--image <path>', 'Send a photo with caption')
   .option('--file <path>', 'Send a document/file with caption (any file type)')
-  .option('--deliverable', 'Treat the message body as a requested document/report; permits a multi-question list but never bypasses an unanswered prior question', false)
-  .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser. Without this flag, sendMessage still retries once with parse_mode disabled on a parse-entity error — so it is purely an opt-in to save the retry roundtrip.', false)
-  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverable?: boolean; plainText?: boolean }) => {
+  .option('--deliverable-for <inbound-message-id>', 'Treat the message as a requested deliverable; provide the inbound message ID that requested it. The daemon verifies the ID exists in the inbound log before relaxing word limits.')
+  .option('--correction-of <message-id>', 'Correct your immediately preceding message in this chat; bypasses only the 10-second cadence block after the message ID is verified')
+  .option('--plain-text', 'Skip Telegram Markdown parsing entirely. Use this when the message contains unescaped _, *, backtick, or [ that would otherwise trip the Markdown parser.', false)
+  .action(async (chatId: string, message: string, opts: { image?: string; file?: string; deliverableFor?: string; correctionOf?: string; plainText?: boolean }) => {
     // Codex agents emit literal '\n'/'\t' inside single-quoted bash where bash
     // does not expand escapes, so they arrive at argv as 2-char literals and
     // Telegram renders them as visible text. Normalize before send + log.
     message = message.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
-    // Resolve bot token: agent .env first, then process.env
+
     const env = resolveEnv();
-    let botToken = '';
-
-    // 1. Check agent .env (most specific)
-    if (env.agentDir) {
-      const { readFileSync, existsSync } = require('fs');
-      const { join } = require('path');
-      const agentEnv = join(env.agentDir, '.env');
-      if (existsSync(agentEnv)) {
-        const content = readFileSync(agentEnv, 'utf-8');
-        const match = content.match(/^BOT_TOKEN=(.+)$/m);
-        if (match && match[1].trim()) botToken = match[1].trim();
-      }
-    }
-
-    // 2. Fall back to process env
-    if (!botToken) {
-      botToken = process.env.BOT_TOKEN || '';
-    }
-
-    if (!botToken) {
-      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
+    if (!env.agentName) {
+      console.error('Error: CTX_AGENT_NAME not set. send-telegram must be called from within an agent context.');
       process.exit(1);
     }
 
-    if (env.agentName && env.ctxRoot) {
-      const styleGateError = checkHumanConversationGate(
-        chatId,
-        message,
-        Boolean(opts.deliverable),
-      );
-      if (styleGateError) {
-        console.error(styleGateError);
-        process.exit(1);
-      }
+    // Route through IPC → TelegramSendService in the daemon.
+    // The daemon owns the bot token and runs the mandatory checker pipeline.
+    // Fail-closed: if the daemon is not running, the send is rejected.
+    const ipc = new IPCClient(env.instanceId || 'default');
 
-      const gateError = checkHumanQuestionGate(
-        env.ctxRoot,
-        env.agentName,
-        chatId,
-        message,
-        Boolean(opts.deliverable),
-      );
-      if (gateError) {
-        console.error(gateError);
-        process.exit(1);
-      }
-    }
+    const deliverableForMsgId = opts.deliverableFor !== undefined
+      ? parseInt(opts.deliverableFor, 10)
+      : undefined;
 
-    const api = new TelegramAPI(botToken);
+    const correctionOf = opts.correctionOf !== undefined
+      ? parseInt(opts.correctionOf, 10)
+      : undefined;
+
+    let resp;
     try {
-      let sentMessageId = 0;
-      if (opts.image) {
-        const result = await api.sendPhoto(chatId, opts.image, message);
-        sentMessageId = result?.result?.message_id ?? 0;
-      } else if (opts.file) {
-        const result = await api.sendDocument(chatId, opts.file, message);
-        sentMessageId = result?.result?.message_id ?? 0;
-      } else {
-        const result = await api.sendMessage(chatId, message, undefined, {
-          parseMode: opts.plainText ? null : 'HTML',
-        });
-        sentMessageId = result?.result?.message_id ?? 0;
-      }
-
-      // Log outbound and cache last-sent for context injection
-      const env = resolveEnv();
-      if (env.agentName && env.ctxRoot) {
-        logOutboundMessage(env.ctxRoot, env.agentName, chatId, message, sentMessageId, {
-          parseMode: opts.plainText ? 'none' : 'html',
-        });
-        markHumanQuestionOpen(env.ctxRoot, env.agentName, chatId, message, sentMessageId);
-        cacheLastSent(env.ctxRoot, env.agentName, chatId, message);
-        // Auto-emit activity event so dashboard sees every Telegram send,
-        // even from agents that never call log-event directly.
-        try {
-          const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-          const preview = message.length > 120 ? message.slice(0, 120) + '…' : message;
-          logEvent(paths, env.agentName, env.org, 'message', 'telegram_sent', 'info', JSON.stringify({ chat_id: chatId, message_id: sentMessageId, preview }));
-        } catch { /* non-fatal */ }
-      }
-
-      console.log('Message sent');
+      resp = await ipc.send({
+        type: 'send-human-message',
+        agent: env.agentName,
+        source: 'cortextos bus send-telegram',
+        data: {
+          chatId,
+          text: message,
+          deliverableForMsgId,
+          correctionOf,
+          image: opts.image,
+          file: opts.file,
+          plainText: opts.plainText === true,
+          source: 'cli',
+        },
+      });
     } catch (err: any) {
-      console.error(`Failed to send: ${err.message || err}`);
+      console.error(`Failed to reach daemon: ${err.message || err}`);
       process.exit(1);
     }
+
+    if (!resp.success) {
+      const rewrite = (resp.data as { rewrite?: string } | undefined)?.rewrite;
+      console.error(resp.error ?? 'Send rejected');
+      if (rewrite) {
+        console.error(`Suggested rewrite: ${rewrite}`);
+      }
+      process.exit(1);
+    }
+
+    console.log('Message sent');
   });
 
 busCommand
@@ -1323,23 +1316,14 @@ busCommand
   .argument('<new-text>', 'Replacement text (Telegram Markdown)')
   .argument('[reply-markup]', 'Optional JSON inline keyboard markup (pass "null" to clear)')
   .action(async (chatId: string, messageId: string, newText: string, replyMarkup?: string) => {
+    // Amendment: gate human-facing edits through the same checker pipeline as new sends.
+    // Routed via IPC → TelegramSendService.handleSendRequest (edit: true path).
     const env = resolveEnv();
-    let botToken = '';
-    if (env.agentDir) {
-      const { readFileSync, existsSync } = require('fs');
-      const agentEnv = require('path').join(env.agentDir, '.env');
-      if (existsSync(agentEnv)) {
-        const match = readFileSync(agentEnv, 'utf-8').match(/^BOT_TOKEN=(.+)$/m);
-        if (match?.[1]?.trim()) botToken = match[1].trim();
-      }
-    }
-    if (!botToken) botToken = process.env.BOT_TOKEN || '';
-    if (!botToken) {
-      console.error('Error: BOT_TOKEN not configured. Set it in your agent .env file or as an environment variable to enable Telegram.');
+    if (!env.agentName) {
+      console.error('Error: agentName not set. Cannot route edit through daemon checker.');
       process.exit(1);
     }
 
-    const api = new TelegramAPI(botToken);
     let markup: object | undefined;
     if (replyMarkup && replyMarkup !== 'null') {
       try { markup = JSON.parse(replyMarkup); } catch { console.error('Invalid reply-markup JSON'); process.exit(1); }
@@ -1347,13 +1331,27 @@ busCommand
       markup = { inline_keyboard: [] }; // clear keyboard
     }
 
-    try {
-      await api.editMessageText(parseInt(chatId, 10), parseInt(messageId, 10), newText, markup);
-      console.log('Message edited');
-    } catch (err: any) {
-      console.error(`Failed to edit message: ${err.message || err}`);
+    const ipc = new IPCClient(env.instanceId || 'default');
+    const resp = await ipc.send({
+      type: 'send-human-message',
+      agent: env.agentName,
+      source: 'cli',
+      data: {
+        chatId,
+        text: newText,
+        replyMarkup: markup,
+        source: 'cli',
+        edit: true,
+        editMessageId: parseInt(messageId, 10),
+      },
+    });
+
+    if (!resp.success) {
+      const hint = (resp.data as any)?.rewrite ? `\nSuggested rewrite: ${(resp.data as any).rewrite}` : '';
+      console.error(`Rejected: ${resp.error}${hint}`);
       process.exit(1);
     }
+    console.log('Message edited');
   });
 
 busCommand
@@ -2606,20 +2604,16 @@ busCommand
     const TOOL_LINE = /^[├│└▶◆●]|^(Tool|Bash|Edit|Write|Read|Glob|Grep|Agent):/i;
 
     let prevOutput = '';
-    let telegramApi: any = null;
     let chatId: string | undefined;
 
-    // Set up Telegram if requested
+    // Set up Telegram chatId if requested (send routes through IPC, not direct TelegramAPI)
     if (opts.telegram) {
-      const { TelegramAPI } = await import('../telegram/api.js');
       const agentDir = process.env.CTX_AGENT_DIR || process.cwd();
       const envPath = join(agentDir, '.env');
       if (existsSync(envPath)) {
         const envContent = readFileSync(envPath, 'utf-8');
-        const botTokenMatch = envContent.match(/^BOT_TOKEN=(.+)$/m);
         const chatIdMatch = envContent.match(/^CHAT_ID=(.+)$/m);
-        if (botTokenMatch && chatIdMatch) {
-          telegramApi = new TelegramAPI(botTokenMatch[1].trim());
+        if (chatIdMatch) {
           chatId = chatIdMatch[1].trim();
         }
       }
@@ -2690,13 +2684,24 @@ busCommand
             logLine(`[event] ${trimmed}`);
           }
 
-          // Forward high-signal events to Telegram (rate-limited)
-          if (isHighSignal && opts.telegram && telegramApi && chatId) {
+          // Forward high-signal events to Telegram via IPC (rate-limited).
+          // Using IPC routes through the daemon-owned token and the send service.
+          if (isHighSignal && opts.telegram && chatId && env.agentName) {
             const now = Date.now();
             if (now - lastTelegramSent >= TELEGRAM_COOLDOWN_MS) {
               lastTelegramSent = now;
               try {
-                await telegramApi.sendMessage(chatId, `[${env.agentName}] ${trimmed}`);
+                const ipc = new IPCClient(env.instanceId || 'default');
+                await ipc.send({
+                  type: 'send-human-message',
+                  agent: env.agentName,
+                  source: 'cortextos bus watch-events',
+                  data: {
+                    chatId,
+                    text: `[${env.agentName}] ${trimmed}`,
+                    source: 'hook',
+                  },
+                });
               } catch { /* Never fail the stream */ }
             }
           }

@@ -320,12 +320,18 @@ async function main(): Promise<void> {
   }
 
   if (message) {
+    // Route through daemon IPC (source: 'hook') so the daemon-owned token
+    // handles the send and the checker pipeline runs. BOT_TOKEN is no longer
+    // used here — the daemon owns it.
     try {
-      const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-      await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text: message }),
+      const { IPCClient } = await import('../daemon/ipc-server.js');
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const ipc = new IPCClient(instanceId);
+      await ipc.send({
+        type: 'send-human-message',
+        agent: agentName,
+        source: 'hook-crash-alert',
+        data: { chatId, text: message, plainText: true, source: 'hook' },
       });
     } catch { /* ignore send failures */ }
   }

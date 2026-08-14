@@ -21,17 +21,16 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-// Capture every sendMessage call so the test can assert on the second positional
-// arg (the message text) after normalization.
-const sendMessageSpy = vi.fn().mockResolvedValue({ result: { message_id: 1 } });
-vi.mock('../../../src/telegram/api.js', () => ({
-  TelegramAPI: class {
-    constructor(_token: string) {}
-    sendMessage(...args: unknown[]) {
-      return sendMessageSpy(...args);
+// Capture every IPC send call so the test can assert on data.text after normalization.
+// The send-telegram CLI command routes through IPCClient → daemon → checker → Telegram.
+// We mock IPCClient at module scope to intercept the call without hitting a real socket.
+const ipcSendSpy = vi.fn().mockResolvedValue({ success: true, data: { sentMessageId: 1 } });
+vi.mock('../../../src/daemon/ipc-server.js', () => ({
+  IPCClient: class {
+    constructor(_instanceId: string) {}
+    send(...args: unknown[]) {
+      return ipcSendSpy(...args);
     }
-    sendPhoto = vi.fn().mockResolvedValue({ result: { message_id: 1 } });
-    sendDocument = vi.fn().mockResolvedValue({ result: { message_id: 1 } });
   },
 }));
 
@@ -61,7 +60,7 @@ beforeEach(() => {
   process.env.BOT_TOKEN = 'fake-token-for-test';
   process.chdir(tempCwd);
 
-  sendMessageSpy.mockClear();
+  ipcSendSpy.mockClear();
 });
 
 afterEach(() => {
@@ -83,8 +82,8 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    expect(sendMessageSpy).toHaveBeenCalledTimes(1);
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    expect(ipcSendSpy).toHaveBeenCalledTimes(1);
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toBe('hello\n\nworld');
     // Sanity: no literal backslash-n survives.
     expect(sentMessage).not.toContain('\\n');
@@ -96,7 +95,7 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toBe('col1\tcol2');
     expect(sentMessage).not.toContain('\\t');
   });
@@ -109,7 +108,7 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toBe('line1\nline2');
   });
 
@@ -122,7 +121,7 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toBe('has\\rcarriage');
   });
 
@@ -132,7 +131,7 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toBe('real\nthen\nliteral');
   });
 
@@ -146,7 +145,7 @@ describe('PR-12: send-telegram normalizes literal \\n / \\t (codex agent fix)', 
       { from: 'user' },
     );
 
-    const sentMessage = sendMessageSpy.mock.calls[0][1] as string;
+    const sentMessage = (ipcSendSpy.mock.calls[0][0] as { data: { text: string } }).data.text;
     expect(sentMessage).toContain('codex-research.\n\nA few quick questions');
     expect(sentMessage).not.toContain('\\n');
   });

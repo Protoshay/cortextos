@@ -8,12 +8,14 @@ import {
   recordInboundTelegram,
   cacheLastSent,
   readLastSent,
+  checkHumanMessageCadenceGate,
   checkHumanQuestionGate,
   checkHumanConversationGate,
   containsBehaviourPromise,
   markHumanQuestionOpen,
   clearHumanQuestion,
   countHumanQuestions,
+  checkFensaWindowGate,
 } from '../../../src/telegram/logging';
 import { TelegramAPI } from '../../../src/telegram/api';
 import type { BusPaths, TelegramMessage } from '../../../src/types';
@@ -242,6 +244,21 @@ describe('Telegram Logging', () => {
       expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'And when?')).toContain('previous question');
     });
 
+    it('recovers an unanswered question from logs when no marker exists', () => {
+      logOutboundMessage(testDir, 'bot1', '999', 'Which one?', 1);
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'And when?')).toContain('conversation log');
+    });
+
+    it('allows a new question after a later inbound reply', () => {
+      logOutboundMessage(testDir, 'bot1', '999', 'Which one?', 1);
+      logInboundMessage(testDir, 'bot1', {
+        chat_id: '999',
+        text: 'The first one',
+        timestamp: new Date(Date.now() + 1_000).toISOString(),
+      });
+      expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'And when?')).toBeNull();
+    });
+
     it('blocks multiple conversational questions in one message', () => {
       expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Which one? And when?')).toContain('only one question');
     });
@@ -253,6 +270,76 @@ describe('Telegram Logging', () => {
     it('does not let deliverable mode bypass an unanswered prior question', () => {
       markHumanQuestionOpen(testDir, 'bot1', '999', 'Which one?', 1);
       expect(checkHumanQuestionGate(testDir, 'bot1', '999', 'Question list: why? when?', true)).toContain('previous question');
+    });
+  });
+
+  describe('human message cadence gate', () => {
+    it('blocks a second conversational send inside 10 seconds without a reply', () => {
+      const now = Date.now();
+      const logDir = join(testDir, 'logs', 'bot1');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'outbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        text: 'First thought',
+        timestamp: new Date(now - 5_000).toISOString(),
+      }) + '\n');
+
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, undefined, now))
+        .toContain('less than 10 seconds');
+    });
+
+    it('allows the next conversational send after 10 seconds', () => {
+      const now = Date.now();
+      const logDir = join(testDir, 'logs', 'bot1');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'outbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        text: 'First thought',
+        timestamp: new Date(now - 10_000).toISOString(),
+      }) + '\n');
+
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, undefined, now)).toBeNull();
+    });
+
+    it('allows a new turn when the human replied inside the window', () => {
+      const now = Date.now();
+      const logDir = join(testDir, 'logs', 'bot1');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'outbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        text: 'First thought',
+        timestamp: new Date(now - 5_000).toISOString(),
+      }) + '\n');
+      writeFileSync(join(logDir, 'inbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        text: 'Reply',
+        timestamp: new Date(now - 2_000).toISOString(),
+      }) + '\n');
+
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, undefined, now)).toBeNull();
+    });
+
+    it('does not apply conversational cadence to a requested deliverable', () => {
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', true)).toBeNull();
+    });
+
+    it('allows a correction only when it supersedes the immediately preceding message', () => {
+      const now = Date.now();
+      const logDir = join(testDir, 'logs', 'bot1');
+      mkdirSync(logDir, { recursive: true });
+      writeFileSync(join(logDir, 'outbound-messages.jsonl'), JSON.stringify({
+        chat_id: '999',
+        message_id: 41,
+        text: 'Thursday',
+        timestamp: new Date(now - 4_000).toISOString(),
+      }) + '\n');
+
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, undefined, now))
+        .toContain('less than 10 seconds');
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, 40, now))
+        .toContain('immediately preceding');
+      expect(checkHumanMessageCadenceGate(testDir, 'bot1', '999', false, 41, now))
+        .toBeNull();
     });
   });
 
@@ -407,5 +494,64 @@ describe('TelegramAPI.sendPhoto', () => {
     expect(body.get('photo')).toBeInstanceOf(Blob);
     expect(body.get('caption')).toBeNull();
     expect(body.get('reply_markup')).toBeNull();
+  });
+});
+
+describe('checkFensaWindowGate', () => {
+  const REAL_BARE_COUNT = '13 have fitting marked Done with FENSA unticked. But 5 look like placeholder rows, so realistically 8 real jobs.';
+  const REAL_REGISTRATION = "Ignaz Fischer's job is now registered with FENSA - one set of doors and two windows, as you said. His certificate gets sent out to him automatically. I've ticked it off on the workshop board.";
+
+  it('refuses a bare FENSA count with no time range (receipt 1)', () => {
+    expect(checkFensaWindowGate(REAL_BARE_COUNT)).toContain('no time range stated');
+  });
+
+  it('passes the same count once a range is stated (receipt 2)', () => {
+    expect(checkFensaWindowGate(`Since Sept 2025: ${REAL_BARE_COUNT}`)).toBeNull();
+    expect(checkFensaWindowGate(`Covering 2025-09-01 to 2026-08-12. ${REAL_BARE_COUNT}`)).toBeNull();
+    expect(checkFensaWindowGate(`All time, no date cut-off. ${REAL_BARE_COUNT}`)).toBeNull();
+  });
+
+  it('passes a non-count FENSA message — proves it discriminates (receipt 3)', () => {
+    expect(checkFensaWindowGate(REAL_REGISTRATION)).toBeNull();
+  });
+
+  it('does not accept the product noun "windows" as a stated range (receipt 4, homograph)', () => {
+    // The joinery homograph: "window" is the product. If it satisfied the gate,
+    // this message would pass while stating no period at all.
+    expect(checkFensaWindowGate('8 FENSA jobs outstanding — 4 windows and 2 doors between them.')).toContain('no time range stated');
+  });
+
+  it('does not accept a span of the results as a range', () => {
+    // Derived from the answer, so it moves with the answer and cannot contradict it.
+    expect(
+      checkFensaWindowGate('8 real FENSA jobs, from Ming Ming last Sept to Alysha in December.'),
+    ).toContain('no time range stated');
+  });
+
+  it('refuses an enumerated FENSA list with per-row dates but no stated window', () => {
+    const list = [
+      'Here are the outstanding FENSAs.',
+      '1. L11601 Ming Ming — 17 Sep 2025 — £70,000',
+      '2. L13626 Antony Young — 23 Oct 2025 — £17,424.97',
+      '3. L13845 Helen Ashmore — 13 Nov 2025 — £20,000',
+    ].join('\n');
+    expect(checkFensaWindowGate(list)).toContain('no time range stated');
+  });
+
+  it('is inert for messages that do not mention FENSA', () => {
+    expect(checkFensaWindowGate('13 jobs are outstanding this week.')).toBeNull();
+  });
+
+  it('is inert for a FENSA message carrying no count', () => {
+    expect(checkFensaWindowGate('Logging into the FENSA portal now.')).toBeNull();
+  });
+
+  it('accepts a relative window', () => {
+    expect(checkFensaWindowGate('In the last 3 months, 7 FENSA jobs are outstanding.')).toBeNull();
+  });
+
+  it('applies to deliverables too — the historical failure was a requested list', () => {
+    // Signature takes text only: there is no deliverable escape hatch by design.
+    expect(checkFensaWindowGate.length).toBe(1);
   });
 });

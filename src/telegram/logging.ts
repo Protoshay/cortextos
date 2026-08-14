@@ -17,9 +17,12 @@ import type { BusPaths, TelegramMessage } from '../types/index.js';
  * - `parseMode`: which parse_mode the first send attempt used. "html"
  *   for the default path (Markdown-to-HTML conversion), "none" when the
  *   caller used --plain-text.
+ * - `correctionOf`: the message ID of the immediately preceding outbound
+ *   message this send corrects, allowing only the cadence bypass.
  */
 export interface OutboundLogMetadata {
   parseMode?: 'html' | 'none';
+  correctionOf?: number;
 }
 
 function openQuestionPath(
@@ -29,6 +32,47 @@ function openQuestionPath(
 ): string {
   const safeChatId = String(chatId).replace(/[^0-9-]/g, '_');
   return join(ctxRoot, 'state', agentName, `.telegram-open-question-${safeChatId}.json`);
+}
+
+interface HumanLogEntry {
+  chat_id?: string | number;
+  message_id?: number;
+  text?: string;
+  timestamp?: string;
+  archived_at?: string;
+}
+
+function readHumanLog(
+  ctxRoot: string,
+  agentName: string,
+  direction: 'inbound' | 'outbound',
+): HumanLogEntry[] {
+  const path = join(ctxRoot, 'logs', agentName, `${direction}-messages.jsonl`);
+  if (!existsSync(path)) return [];
+
+  try {
+    return readFileSync(path, 'utf-8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as HumanLogEntry);
+  } catch (err) {
+    throw new Error(`Could not verify recent ${direction} Telegram history: ${err}`);
+  }
+}
+
+function entryTime(entry: HumanLogEntry): number {
+  const raw = entry.timestamp ?? entry.archived_at;
+  const parsed = raw ? Date.parse(raw) : Number.NaN;
+  if (!Number.isFinite(parsed)) {
+    throw new Error('Could not verify Telegram history because an entry has no valid timestamp');
+  }
+  return parsed;
+}
+
+function latestEntryTime(entries: HumanLogEntry[], chatId: string | number): number | null {
+  const matching = entries.filter((entry) => String(entry.chat_id) === String(chatId));
+  if (matching.length === 0) return null;
+  return Math.max(...matching.map(entryTime));
 }
 
 export function containsBehaviourPromise(text: string): boolean {
@@ -63,7 +107,7 @@ export function checkHumanConversationGate(
 
   const words = countWords(text);
   if (words > 50) {
-    return `Blocked: conversational Telegram replies may not exceed 50 words (received ${words}). Shorten it or use --deliverable for a requested report/document.`;
+    return `Blocked: conversational Telegram replies may not exceed 50 words (received ${words}). Shorten it, or if this is a report/document the person actually asked for, resend with --deliverable-for <inbound-message-id> naming the message that requested it.`;
   }
 
   if (containsBehaviourPromise(text)) {
@@ -97,6 +141,82 @@ export function checkHumanConversationGate(
 }
 
 /**
+ * A FENSA count or list sent to a person must state the time range it covers.
+ *
+ * Measured 2026-08-12 across this agent's own outbound log: of 148 FENSA-
+ * mentioning messages to the ops lead between 2026-05-21 and 2026-08-11, ZERO
+ * contained any terminal output and ZERO stated a time range. The generating
+ * script was fixed the same day to require an explicit --window and to print it
+ * in a header, but that header never reaches the person: every count is relayed
+ * as a conversational sentence. The guard therefore has to live here, in the
+ * writer, because the terminal and the conversation are different surfaces.
+ *
+ * ⛔ `window` IS DELIBERATELY NOT A SATISFYING TOKEN. This is a joinery
+ * business: "window" is the product. A first attempt at measuring the problem
+ * scored 6 of 13 messages as carrying a time window and all six were glazing
+ * units. If the product noun satisfied this gate, "4 windows and 2 doors" would
+ * satisfy it, and the gate would pass precisely the message it exists to stop.
+ *
+ * Deliberately NOT exempt for deliverables, unlike the style and cadence gates:
+ * the historical failure was a requested list, so exempting requested lists
+ * would exempt the only case that has actually gone wrong.
+ *
+ * Fail direction is toward refusal. A false block costs one rewrite and is
+ * visible; a false pass is invisible and is the defect itself.
+ */
+const FENSA_COUNT_NOUNS = 'jobs?|installs?|installations?|registrations?|certificates?|submissions?|rows?|entries|outstanding|pending|unticked|awaiting|done|fitted';
+
+/** A number quantifying a set of jobs, or an enumerated list of 2+ rows. */
+function looksLikeFensaCount(text: string): boolean {
+  // Digit quantifying a job-ish noun within the same clause.
+  if (new RegExp(String.raw`\b\d{1,3}\b[^.\n]{0,45}\b(?:${FENSA_COUNT_NOUNS})\b`, 'i').test(text)) {
+    return true;
+  }
+  // Spelled-out number immediately quantifying a job-ish noun. Kept tight so a
+  // single-job product description ("one set of doors and two windows") does
+  // not trip it — that is a legitimate message, not a count answer.
+  if (new RegExp(String.raw`\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+(?:${FENSA_COUNT_NOUNS})\b`, 'i').test(text)) {
+    return true;
+  }
+  // An enumerated list of two or more rows.
+  const rows = text.match(/^\s*\d+[.)]\s+\S/gm);
+  return (rows?.length ?? 0) >= 2;
+}
+
+const MONTH = 'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec';
+
+/** An explicitly stated time range, or an explicit statement of unboundedness. */
+function statesTimeRange(text: string): boolean {
+  const JOIN = String.raw`\s*(?:to|and|until|through|–|—|-|\.\.)\s*`;
+  const ISO = String.raw`\d{4}-\d{2}-\d{2}`;
+  const TEXTUAL = String.raw`(?:\d{1,2}\s+)?(?:${MONTH})[a-z]*\.?\s+\d{4}`;
+  const patterns = [
+    // 2025-09-01 to 2026-08-12
+    new RegExp(ISO + JOIN + ISO, 'i'),
+    // Sept 2025 to Dec 2025 / 17 Sep 2025 — 19 Dec 2025
+    new RegExp(TEXTUAL + JOIN + TEXTUAL, 'i'),
+    // in the last 3 months / over the past 90 days
+    /\b(?:in|over|during|for|from)\s+the\s+(?:last|past)\s+\d+\s+(?:days?|weeks?|months?|years?)\b/i,
+    // since 2025-09-01 / since Sept 2025 / up to 12 Aug 2026
+    new RegExp(String.raw`\b(?:since|before|after|up\s+to|as\s+(?:at|of))\s+(?:${ISO}|${TEXTUAL})`, 'i'),
+    // explicit unboundedness — the counterpart of the script's `--window ALL`
+    /\b(?:all\s+time|all\s+dates|any\s+date|no\s+(?:date\s+)?(?:cut-?off|limit|filter|range)|unbounded|regardless\s+of\s+date|every\s+job\s+on\s+the\s+board|going\s+back\s+to\s+the\s+start)\b/i,
+  ];
+  return patterns.some((p) => p.test(text));
+}
+
+export function checkFensaWindowGate(text: string): string | null {
+  // Substring, NOT /\bfensa\b/. The real message this gate exists to catch
+  // opened "Here are the outstanding FENSAs" — a trailing word boundary misses
+  // the plural, and the tighter form was silently inert on it.
+  if (!/fensa/i.test(text)) return null;
+  if (!looksLikeFensaCount(text)) return null;
+  if (statesTimeRange(text)) return null;
+
+  return 'Blocked: this is a FENSA count or list with no time range stated. Say which period it covers (for example "since Sept 2025", "2025-09-01 to 2026-08-12", or "all time, no date cut-off"). A count without its window is not a smaller answer to the same question — it answers a different question and looks identical on the page. Note that "windows" as a product does not count as stating a range, and neither does the span of the results themselves ("from Ming Ming last Sept to Alysha in December"): a range derived from the answer moves with the answer and can never contradict it.';
+}
+
+/**
  * Enforce one open conversational question per human/chat.
  *
  * A requested deliverable may contain a question list in one message, but it
@@ -116,11 +236,72 @@ export function checkHumanQuestionGate(
     return 'Blocked: the previous question to this person is still unanswered. Wait for their reply before opening another question.';
   }
 
+  try {
+    const inbound = readHumanLog(ctxRoot, agentName, 'inbound');
+    const lastInboundAt = latestEntryTime(inbound, chatId) ?? Number.NEGATIVE_INFINITY;
+    const hasUnansweredLoggedQuestion = readHumanLog(ctxRoot, agentName, 'outbound')
+      .filter((entry) => String(entry.chat_id) === String(chatId))
+      .some((entry) => entryTime(entry) > lastInboundAt && countHumanQuestions(entry.text ?? '') > 0);
+    if (hasUnansweredLoggedQuestion) {
+      return 'Blocked: the conversation log shows an earlier question to this person is still unanswered. Wait for their reply before opening another question.';
+    }
+  } catch (err) {
+    return `Blocked: ${err instanceof Error ? err.message : String(err)}`;
+  }
+
   if (!deliverable && questionCount > 1) {
-    return 'Blocked: conversational Telegram messages may ask only one question. Use one useful question now, or --deliverable for a requested document/report.';
+    return 'Blocked: conversational Telegram messages may ask only one question. Ask the one useful question now, or if this is a document/report the person actually asked for, resend with --deliverable-for <inbound-message-id> naming the message that requested it.';
   }
 
   return null;
+}
+
+/**
+ * Prevent rapid successive conversational sends from becoming a multi-message
+ * dump. A human reply opens a new turn. Requested deliverables are exempt.
+ */
+export function checkHumanMessageCadenceGate(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+  deliverable = false,
+  correctionOf?: number,
+  now = Date.now(),
+): string | null {
+  if (deliverable) return null;
+
+  try {
+    const outbound = readHumanLog(ctxRoot, agentName, 'outbound')
+      .filter((entry) => String(entry.chat_id) === String(chatId))
+      .sort((a, b) => entryTime(b) - entryTime(a));
+    const lastOutbound = outbound[0];
+    const lastOutboundAt = lastOutbound ? entryTime(lastOutbound) : null;
+    if (lastOutboundAt === null) return null;
+
+    if (correctionOf !== undefined) {
+      if (!Number.isInteger(correctionOf) || correctionOf <= 0) {
+        return 'Blocked: --correction-of must name a valid Telegram message ID.';
+      }
+      if (lastOutbound?.message_id !== correctionOf) {
+        return 'Blocked: --correction-of must name your immediately preceding message in this chat.';
+      }
+      return null;
+    }
+
+    const lastInboundAt = latestEntryTime(readHumanLog(ctxRoot, agentName, 'inbound'), chatId);
+    if (lastInboundAt !== null && lastInboundAt > lastOutboundAt) return null;
+
+    const elapsed = now - lastOutboundAt;
+    if (elapsed < 0) {
+      return 'Blocked: recent Telegram timing could not be verified because the last message is dated in the future.';
+    }
+    if (elapsed < 10_000) {
+      return 'Blocked: another message was sent to this person less than 10 seconds ago without a reply. Combine the thought into one message or wait.';
+    }
+    return null;
+  } catch (err) {
+    return `Blocked: ${err instanceof Error ? err.message : String(err)}`;
+  }
 }
 
 /** Record a successfully delivered human-facing question. */
@@ -173,6 +354,7 @@ export function logOutboundMessage(
   // stays unchanged for callers that pass nothing (backwards compat).
   const meta: Record<string, unknown> = {};
   if (metadata?.parseMode !== undefined) meta.parse_mode = metadata.parseMode;
+  if (metadata?.correctionOf !== undefined) meta.correction_of = metadata.correctionOf;
 
   const entry = JSON.stringify({
     timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),

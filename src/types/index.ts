@@ -634,7 +634,11 @@ export type IPCCommandType =
   | 'add-cron'
   | 'update-cron'
   | 'remove-cron'
-  | 'fleet-health';
+  | 'fleet-health'
+  /** Gate-checked human-facing Telegram send. Handled asynchronously by TelegramSendService. */
+  | 'send-human-message'
+  /** Amendment: gate activity-channel sends through the daemon-owned activityApi. */
+  | 'send-activity-message';
 
 // ---------------------------------------------------------------------------
 // Execution log pagination response — Subtask 4.3

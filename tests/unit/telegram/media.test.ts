@@ -2,7 +2,12 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { classifyProcessedMediaType, sanitizeFilename, processMediaMessage } from '../../../src/telegram/media';
+import {
+  classifyProcessedMediaType,
+  formatUnknownMediaPayload,
+  sanitizeFilename,
+  processMediaMessage,
+} from '../../../src/telegram/media';
 import type { TelegramMessage } from '../../../src/types';
 
 // Mock TelegramAPI
@@ -65,6 +70,18 @@ describe('classifyProcessedMediaType', () => {
   it('surfaces an unrecognised runtime type as UNKNOWN', () => {
     expect(classifyProcessedMediaType('animation')).toBe('UNKNOWN');
   });
+});
+
+describe('formatUnknownMediaPayload', () => {
+  it.each(['unrecognised_type', 'processing_failed'] as const)(
+    'carries %s as an explicit UNKNOWN verdict',
+    (reason) => {
+      const payload = formatUnknownMediaPayload('caption', reason);
+      expect(payload).toContain('[UNKNOWN_MEDIA]');
+      expect(payload).toContain(`reason: ${reason}`);
+      expect(payload).toContain('status: UNKNOWN');
+    },
+  );
 });
 
 describe('processMediaMessage', () => {

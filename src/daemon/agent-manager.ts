@@ -14,7 +14,8 @@ import { resolveEnv } from '../utils/env.js';
 import { recordInboundTelegram, cacheLastSent, logOutboundMessage, buildRecentHistory } from '../telegram/logging.js';
 import { collectTelegramCommands, registerTelegramCommands } from '../bus/metrics.js';
 import { stripControlChars } from '../utils/validate.js';
-import { classifyProcessedMediaType, processMediaMessage } from '../telegram/media.js';
+import { classifyProcessedMediaType, formatUnknownMediaPayload, processMediaMessage } from '../telegram/media.js';
+import { TelegramSendService, readCheckerConfig } from './telegram-send-service.js';
 import type { InjectionOrigin } from './working-hours.js';
 import { isLondonWeekdayWorkingTime } from './working-hours.js';
 import { CloseLifecycleCoordinator, waitForReadySession, type CloseStage } from './close-lifecycle.js';
@@ -25,7 +26,7 @@ type LogFn = (msg: string) => void;
  * Manages all agents in a cortextOS instance.
  */
 export class AgentManager {
-  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller }> = new Map();
+  private agents: Map<string, { process: AgentProcess; checker: FastChecker; poller?: TelegramPoller; activityPoller?: TelegramPoller; sendService?: TelegramSendService; activityApi?: TelegramAPI; activityChatId?: string; activitySendService?: TelegramSendService }> = new Map();
   private workers: Map<string, WorkerProcess> = new Map();
   /** Daemon-level cron scheduler registry: one CronScheduler per enabled agent. */
   private cronSchedulers: Map<string, CronScheduler> = new Map();
@@ -322,27 +323,51 @@ export class AgentManager {
       chatId,
       allowedUserId: allowedUserId ? parseInt(allowedUserId, 10) : undefined,
       telegramBurstDebounceMs: config.telegram_burst_debounce_ms,
+      // sendService is set below after construction (avoids forward-reference issue)
+      org: resolvedOrg,
     });
 
-    // Send Telegram notification on crashes and session refreshes
-    if (telegramApi && chatId) {
-      const tgApi = telegramApi;
+    // Construct TelegramSendService — daemon-owned gatekeeper for all human sends.
+    // This holds the TelegramAPI instance and runs the mandatory checker pipeline.
+    let sendService: TelegramSendService | undefined;
+    if (telegramApi) {
+      const checkerConfig = readCheckerConfig(this.ctxRoot);
+      const openaiKey = process.env.OPENAI_API_KEY ?? '';
+      sendService = new TelegramSendService({
+        api: telegramApi,
+        ctxRoot: this.ctxRoot,
+        agentName: name,
+        instanceId: this.instanceId,
+        org: resolvedOrg,
+        checkerConfig,
+        openaiKey,
+      });
+      // Wire into the fast-checker so sendDirect() calls in lines 982/1220 use
+      // the service instead of the raw TelegramAPI reference.
+      checker.setSendService(sendService);
+    }
+
+    // Send Telegram notification on crashes and session refreshes.
+    // Routed through sendDirect so the daemon-owned token is used and the
+    // send is recorded in the outbound log (no checker for system alerts).
+    if (sendService && chatId) {
+      const svc = sendService;
       const tgChatId = chatId;
       let prevStatus: string | null = null;
       agentProcess.onStatusChanged((status) => {
         if (status.status === 'crashed') {
           const crashNum = status.crashCount ?? '?';
-          tgApi.sendMessage(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
+          svc.sendDirect(tgChatId, `Agent ${name} crashed (crash #${crashNum}) — auto-restarting`).catch(() => {});
         } else if (status.status === 'halted') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
+          svc.sendDirect(tgChatId, `Agent ${name} HALTED — exceeded crash limit. Restart manually with: cortextos start ${name}`).catch(() => {});
         } else if (status.status === 'running' && prevStatus === 'crashed') {
-          tgApi.sendMessage(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
+          svc.sendDirect(tgChatId, `Agent ${name} recovered and is back online`).catch(() => {});
         }
         prevStatus = status.status;
       });
     }
 
-    this.agents.set(name, { process: agentProcess, checker });
+    this.agents.set(name, { process: agentProcess, checker, sendService });
 
     // Start agent
     await agentProcess.start();
@@ -416,12 +441,20 @@ export class AgentManager {
           const downloadDir = join(agentDir, 'telegram-images');
           processMediaMessage(msg, telegramApi, downloadDir).then((media) => {
             if (!media) {
-              log('Media processing returned null - falling back to text format');
-              const text = stripControlChars(msg.caption || '');
-              const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+              const unknownPayload = formatUnknownMediaPayload(
+                stripControlChars(msg.caption || ''),
+                'processing_failed',
+              );
+              const formatted = FastChecker.formatTelegramTextMessage(
+                from,
+                effectiveChatId,
+                unknownPayload,
+                this.frameworkRoot,
+              );
               if (!checker.isDuplicate(formatted)) {
-                checker.queueTelegramMessage(formatted, String(effectiveChatId), text);
+                checker.queueTelegramMessage(formatted, String(effectiveChatId), unknownPayload);
               }
+              log('Media processing returned null - surfaced as UNKNOWN');
               return;
             }
 
@@ -438,7 +471,7 @@ export class AgentManager {
 
             log(`[DEBUG] media.type=${media.type} image_path=${JSON.stringify(relImagePath)} file_path=${JSON.stringify(relFilePath)}`);
             if (mediaType === 'UNKNOWN') {
-              const unknownPayload = `[UNKNOWN_MEDIA]\ncaption: ${media.text}\nstatus: UNKNOWN — attachment type was not recognised`;
+              const unknownPayload = formatUnknownMediaPayload(media.text, 'unrecognised_type');
               const formatted = FastChecker.formatTelegramTextMessage(
                 from,
                 effectiveChatId,
@@ -481,11 +514,19 @@ export class AgentManager {
             }
             checker.queueTelegramMessage(formatted, String(effectiveChatId), burstPayload);
           }).catch((err) => {
-            log(`Media processing error: ${err} - falling back to text format`);
-            const text = stripControlChars(msg.caption || '');
-            const formatted = FastChecker.formatTelegramTextMessage(from, effectiveChatId, text, this.frameworkRoot);
+            log(`Media processing error surfaced as UNKNOWN: ${err}`);
+            const unknownPayload = formatUnknownMediaPayload(
+              stripControlChars(msg.caption || ''),
+              'processing_failed',
+            );
+            const formatted = FastChecker.formatTelegramTextMessage(
+              from,
+              effectiveChatId,
+              unknownPayload,
+              this.frameworkRoot,
+            );
             if (!checker.isDuplicate(formatted)) {
-              checker.queueTelegramMessage(formatted, String(effectiveChatId), text);
+              checker.queueTelegramMessage(formatted, String(effectiveChatId), unknownPayload);
             }
           });
           return;
@@ -632,6 +673,28 @@ export class AgentManager {
     }
 
     const activityApi = new TelegramAPI(activityBotToken);
+
+    // Create a TelegramSendService wrapping the activityApi so all activity-channel
+    // sends run through the full checker pipeline (deterministic + semantic).
+    const activityCheckerConfig = readCheckerConfig(this.ctxRoot);
+    const activitySendService = new TelegramSendService({
+      api: activityApi,
+      ctxRoot: this.ctxRoot,
+      agentName: name,
+      instanceId: this.instanceId,
+      org: this.org,
+      checkerConfig: activityCheckerConfig,
+      openaiKey: process.env.OPENAI_API_KEY ?? '',
+    });
+
+    // Store on the agent entry so sendActivityMessage() can reach the service.
+    const existingEntry = this.agents.get(name);
+    if (existingEntry) {
+      existingEntry.activityApi = activityApi;
+      existingEntry.activityChatId = activityChatId;
+      existingEntry.activitySendService = activitySendService;
+    }
+
     const stateDir = join(this.ctxRoot, 'state', name);
     // offsetFileSuffix keeps the activity poller's offset file distinct
     // from the primary bot's .telegram-offset — without this they would
@@ -795,6 +858,44 @@ export class AgentManager {
   }
 
   /**
+   * Get the TelegramSendService for an agent.
+   * Returns null if the agent is not running or has no Telegram credentials.
+   * Used by the IPC 'send-human-message' handler.
+   */
+  getTelegramSendService(name: string): TelegramSendService | null {
+    return this.agents.get(name)?.sendService ?? null;
+  }
+
+  /**
+   * Send a message to the org's activity channel via the daemon-owned
+   * activitySendService. Routes through the full checker pipeline (deterministic
+   * + semantic) — activity-channel messages are human-facing and must meet
+   * the same quality bar as conversational replies.
+   * Returns true if accepted and sent, false if rejected or not configured.
+   */
+  async sendActivityMessage(org: string, text: string, replyMarkup?: object): Promise<boolean> {
+    // Find the orchestrator entry that owns this org's activity send service.
+    for (const [agentName, entry] of this.agents) {
+      if (entry.activitySendService && entry.activityChatId) {
+        try {
+          const result = await entry.activitySendService.handleSendRequest({
+            agentName,
+            chatId: entry.activityChatId,
+            text,
+            source: 'hook',
+            replyMarkup,
+            plainText: true,
+          });
+          return result.ok;
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
    * Get all agent names.
    */
   getAgentNames(): string[] {
@@ -811,10 +912,18 @@ export class AgentManager {
 
   // --- Worker management ---
 
+  /** Fleet-scoped admission check for autonomous worker lifecycle actions. */
+  isAutonomousWorkAllowed(): boolean {
+    return this.org !== 'todi-and-boys' || isLondonWeekdayWorkingTime();
+  }
+
   /**
    * Spawn an ephemeral worker session for a parallelized task.
    */
   async spawnWorker(name: string, dir: string, prompt: string, parent?: string, model?: string): Promise<void> {
+    if (!this.isAutonomousWorkAllowed()) {
+      throw new Error('Working-hours gate: worker spawn blocked outside Europe/London weekday 07:00-19:00');
+    }
     if (this.workers.has(name)) {
       throw new Error(`Worker "${name}" is already running`);
     }
@@ -868,6 +977,7 @@ export class AgentManager {
    * Inject text into a running worker's PTY (nudge / stuck-state recovery).
    */
   injectWorker(name: string, text: string): boolean {
+    if (!this.isAutonomousWorkAllowed()) return false;
     const worker = this.workers.get(name);
     if (!worker) return false;
     return worker.inject(text);
@@ -963,7 +1073,7 @@ export class AgentManager {
       // dedup-rejected and treated as a dispatch failure.
       const firedAt = new Date().toISOString();
       const injection = `[CRON FIRED ${firedAt}] ${cron.name}: ${prompt}`;
-      const injected = this.injectAgent(agentName, injection);
+      const injected = this.injectAgent(agentName, injection, 'cron');
       if (!injected) {
         throw new Error(`injectAgent returned false for agent "${agentName}" — agent may not be running`);
       }

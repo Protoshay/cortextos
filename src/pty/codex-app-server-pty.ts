@@ -9,6 +9,7 @@ import { ensureDir, atomicWriteSync } from '../utils/atomic.js';
 import { resolvePaths } from '../utils/paths.js';
 import { logEvent } from '../bus/event.js';
 import { WsUnixJsonRpcClient, type JsonRpcResponse } from '../utils/ws-unix-client.js';
+import { IPCClient } from '../daemon/ipc-server.js';
 
 interface IPty {
   pid: number;
@@ -569,8 +570,22 @@ export class CodexAppServerPTY {
    */
   private replyLocal(text: string): void {
     this._outputBuffer.push(text + '\n');
-    if (this._telegramApi && this._chatId) {
-      this._telegramApi.sendMessage(this._chatId, text, undefined, { parseMode: null }).catch(() => {});
+    // Route through IPC so the daemon-owned token is used (no semantic checker
+    // for these local-command system replies, source: 'hook').
+    if (this._chatId && this._env?.agentName) {
+      const instanceId = this._env.instanceId || 'default';
+      const ipc = new IPCClient(instanceId);
+      ipc.send({
+        type: 'send-human-message',
+        agent: this._env.agentName,
+        source: 'codex-app-server-pty',
+        data: {
+          chatId: this._chatId,
+          text,
+          plainText: true,
+          source: 'hook',
+        },
+      }).catch(() => {});
     }
   }
 

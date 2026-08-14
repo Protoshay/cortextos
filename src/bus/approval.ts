@@ -5,9 +5,9 @@ import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { parseEnvFile } from '../utils/env.js';
 import { randomString } from '../utils/random.js';
 import { validateApprovalCategory } from '../utils/validate.js';
-import { TelegramAPI } from '../telegram/api.js';
 import { sendMessage } from './message.js';
 import { postActivity } from './system.js';
+import { IPCClient } from '../daemon/ipc-server.js';
 
 /**
  * Build the inline keyboard posted to the activity channel alongside a
@@ -153,10 +153,21 @@ function pingAgentChatId(
   lines.push('', 'Approve via the orchestrator chat (Approve/Deny buttons) or the dashboard.');
   const message = lines.join('\n');
 
-  const api = new TelegramAPI(botToken);
-  return api.sendMessage(chatId, message, undefined, { parseMode: null })
-    .then(() => undefined)
-    .catch(() => undefined); // Telegram outage must not fail approval creation.
+  // Route through IPC so the daemon-owned token handles the send.
+  // Fail gracefully: approval ping failures must never block approval creation.
+  const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+  const ipc = new IPCClient(instanceId);
+  return ipc.send({
+    type: 'send-human-message',
+    agent: agentName,
+    source: 'approval.ts pingAgentChatId',
+    data: {
+      chatId,
+      text: message,
+      plainText: true,
+      source: 'hook',
+    },
+  }).then(() => undefined).catch(() => undefined);
 }
 
 /**

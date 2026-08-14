@@ -45,6 +45,14 @@ export type ValidateCredentialsResult =
       detail: string;
     };
 
+export function requireSentMessageId(result: unknown): number {
+  const messageId = (result as { result?: { message_id?: unknown } } | null)?.result?.message_id;
+  if (!Number.isInteger(messageId) || (messageId as number) <= 0) {
+    throw new Error('Telegram API returned success without a valid message_id');
+  }
+  return messageId as number;
+}
+
 /**
  * Format a human-readable error message for a failed ValidateCredentialsResult.
  * Single source of truth for the CLI-facing error strings so setup.ts and

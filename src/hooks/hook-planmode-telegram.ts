@@ -5,7 +5,7 @@
  * Timeout: 1800s (30 min), auto-APPROVES so agents aren't blocked if user is away.
  */
 
-import { TelegramAPI } from '../telegram/api';
+import { IPCClient } from '../daemon/ipc-server';
 import {
   readStdin,
   parseHookInput,
@@ -101,10 +101,26 @@ async function main(): Promise<void> {
 
   const messageText = `PLAN REVIEW - ${env.agentName}\n\n${planContent}`;
   const keyboard = buildPlanKeyboard(uniqueId);
-  const api = new TelegramAPI(env.botToken);
 
   try {
-    await api.sendMessage(env.chatId, messageText, keyboard);
+    const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+    const ipc = new IPCClient(instanceId);
+    const resp = await ipc.send({
+      type: 'send-human-message',
+      agent: env.agentName,
+      source: 'hook-planmode-telegram',
+      data: {
+        chatId: env.chatId,
+        text: messageText,
+        replyMarkup: keyboard,
+        source: 'hook',
+      },
+    });
+    if (!resp.success) {
+      // If send fails, auto-approve so agent isn't blocked
+      outputDecision('allow');
+      return;
+    }
   } catch {
     // If send fails, auto-approve so agent isn't blocked
     outputDecision('allow');
@@ -130,10 +146,18 @@ async function main(): Promise<void> {
   } else {
     // Timeout - auto-APPROVE (not deny!) so agents aren't blocked
     try {
-      await api.sendMessage(
-        env.chatId,
-        `Plan review TIMED OUT (auto-approved): ${env.agentName}`,
-      );
+      const instanceId = process.env.CTX_INSTANCE_ID || 'default';
+      const ipc = new IPCClient(instanceId);
+      await ipc.send({
+        type: 'send-human-message',
+        agent: env.agentName,
+        source: 'hook-planmode-telegram',
+        data: {
+          chatId: env.chatId,
+          text: `Plan review TIMED OUT (auto-approved): ${env.agentName}`,
+          source: 'hook',
+        },
+      });
     } catch {
       // Ignore notification failure
     }
