@@ -259,9 +259,16 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
  * Update a task's status. Matches bash update-task.sh behavior, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
+ *
+ * `actor` is the agent RUNNING the update, which is exactly the case the
+ * cross-org fallback above exists to support and is not always the assignee.
+ * It sits second, matching `createTask`, so that a stale positional call
+ * fails loudly in `findTaskFile` instead of quietly filing the status string
+ * as the actor.
  */
 export function updateTask(
   paths: BusPaths,
+  actor: string,
   taskId: string,
   status: TaskStatus,
   desc?: string,
@@ -273,12 +280,10 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
-    assignee = task.assigned_to;
     task.status = status;
     if (desc !== undefined) task.description = desc;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -286,18 +291,31 @@ export function updateTask(
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, { event: 'update', agent: actor || 'unknown', from: prevStatus, to: status });
 }
 
 /**
  * One audit entry written to a task's append-only JSONL log. Every
  * status transition, claim, and completion emits one of these so the
  * full lifecycle can be replayed from disk.
+ *
+ * ⛔ ENTRIES WRITTEN BEFORE 2026-08-14 CANNOT BE TRUSTED FOR `agent` ON
+ * `update`/`complete`. Both paths recorded `task.assigned_to` — the task's
+ * ASSIGNEE — instead of the caller, so a second agent's write to someone
+ * else's task was logged under the assignee's name. `create` and `claim` were
+ * always correct. Nothing distinguishes an old row from a new one, and the old
+ * value cannot be recovered from the logs, so historical attribution on those
+ * two events is lost rather than wrong-but-fixable. It read as plausible
+ * precisely because the name it produced was the one a reader expected.
  */
 export interface TaskAuditEntry {
   ts: string; // ISO 8601
   event: 'create' | 'claim' | 'update' | 'complete';
-  agent: string; // who caused the event
+  /**
+   * Who PERFORMED the event — never who the task is assigned to. The two
+   * coincide most of the time, which is what let the old bug survive.
+   */
+  agent: string;
   from?: TaskStatus;
   to?: TaskStatus;
   note?: string;
@@ -463,6 +481,7 @@ export function claimTask(
  */
 export function completeTask(
   paths: BusPaths,
+  actor: string,
   taskId: string,
   result?: string,
 ): void {
@@ -491,7 +510,7 @@ export function completeTask(
   } catch (err) {
     throw new Error(`Task ${taskId} complete failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'complete', agent: assignee || 'unknown', from: prevStatus, to: 'completed', note: result });
+  appendTaskAudit(paths, taskId, { event: 'complete', agent: actor || 'unknown', from: prevStatus, to: 'completed', note: result });
 
   // Activity-feed event. Best-effort — the task is already persisted.
   if (assignee) {

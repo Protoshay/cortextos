@@ -248,7 +248,7 @@ busCommand
       console.log(`Description ${opts.replaceDesc ? 'replaced' : 'appended'}: ${before.length} -> ${descriptionUpdate.length} chars`);
     }
 
-    updateTask(paths, id, resolvedStatus, descriptionUpdate);
+    updateTask(paths, env.agentName, id, resolvedStatus, descriptionUpdate);
     console.log(`Updated ${id} -> ${resolvedStatus}`);
   });
 
@@ -359,7 +359,7 @@ busCommand
       }
     }
 
-    completeTask(paths, id, effectiveResult);
+    completeTask(paths, env.agentName, id, effectiveResult);
     console.log(`Completed ${id}`);
   });
 
