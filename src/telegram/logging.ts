@@ -466,28 +466,49 @@ export function readLastSent(
 
 /**
  * Build a short recent conversation snippet for context injection.
- * Reads the last cputime         unlimited
-filesize        unlimited
-datasize        unlimited
-stacksize       7MB
-
-
-/**
- * Build a short recent conversation snippet for context injection.
  * Reads the last `limit` messages (combined inbound + outbound) for the
  * given agent/chatId, sorts by timestamp, and returns a formatted string.
  * Returns null if no history is available.
+ *
+ * `maxAgeHours` bounds the window in TIME as well as in count. It is optional
+ * and OFF by default, so the context-injection caller is unchanged.
+ *
+ * WHY IT EXISTS: the message checker feeds this snippet to the semantic gate,
+ * and the outbound log only gains an entry when a send SUCCEEDS
+ * (telegram-send-service returns early on rejection, before doSend). So once a
+ * draft is rejected, the history the next draft is judged against is byte-for-
+ * byte the history the last one was judged against — the window cannot
+ * self-advance, and a closed thread anchors every later unrelated draft
+ * forever. skiffy's Shay channel sat frozen on a 2026-08-11T14:25:37Z pair
+ * ending "Understood — I won't pursue this" for three days and 15+ rejected
+ * sends. A count-based limit cannot fix this: 2 stale entries are still 2
+ * entries. Only a time bound can empty the window.
+ *
+ * An entry whose timestamp is missing or unparseable is treated as OUTSIDE the
+ * window, not inside it. That direction is deliberate: the failure mode being
+ * fixed is stale context poisoning a live check, and dropping history is the
+ * safe direction — `assembleCheckerContext` omits the section entirely when
+ * this returns null, so the gate judges the draft on its own merits.
  */
 export function buildRecentHistory(
   ctxRoot: string,
   agentName: string,
   chatId: string | number,
   limit: number = 6,
+  maxAgeHours?: number,
 ): string | null {
   const logDir = join(ctxRoot, 'logs', agentName);
   const inboundPath = join(logDir, 'inbound-messages.jsonl');
   const outboundPath = join(logDir, 'outbound-messages.jsonl');
   const chatIdStr = String(chatId);
+
+  // When `maxAgeHours` is omitted the window is unbounded — the historical
+  // behaviour, kept for the context-injection caller. When it is supplied,
+  // entries older than the cutoff are dropped. See the docblock above for why
+  // an undatable entry counts as out-of-window rather than in.
+  const cutoffMs = maxAgeHours == null
+    ? null
+    : Date.now() - Math.max(0, maxAgeHours) * 3_600_000;
 
   interface Entry { ts: string; speaker: string; text: string; }
   const entries: Entry[] = [];
@@ -505,7 +526,12 @@ export function buildRecentHistory(
           if (String(obj.chat_id) !== chatIdStr) continue;
           const text = (obj.text || '').trim();
           if (!text) continue;
-          entries.push({ ts: obj.timestamp || obj.archived_at || '', speaker, text });
+          const ts = obj.timestamp || obj.archived_at || '';
+          if (cutoffMs !== null) {
+            const parsed = Date.parse(ts);
+            if (!Number.isFinite(parsed) || parsed < cutoffMs) continue;
+          }
+          entries.push({ ts, speaker, text });
         } catch { /* skip malformed */ }
       }
     } catch { /* skip unreadable */ }

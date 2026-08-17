@@ -63,6 +63,18 @@ import {
 
 /** Plain-language semantic review is required for the two agents with evidence. */
 export const MESSAGE_CHECKER_AGENTS = new Set(['otis', 'skiffy']);
+
+/**
+ * Age bound on the conversation snippet handed to the semantic gate.
+ *
+ * The outbound log only advances when a send SUCCEEDS — a rejection returns
+ * before `doSend`. So without a time bound the window is a fixed point: every
+ * rejected draft is judged against exactly the history that rejected the last
+ * one. Scoped to this call site on purpose; the context-injection caller in
+ * agent-manager keeps the unbounded window, since it gates nothing.
+ */
+export const CHECKER_HISTORY_MAX_AGE_HOURS = 24;
+
 import { logEvent } from '../bus/event.js';
 import { resolvePaths } from '../utils/paths.js';
 
@@ -253,6 +265,7 @@ export class TelegramSendService {
         this.agentName,
         req.chatId,
         2,
+        CHECKER_HISTORY_MAX_AGE_HOURS,
       );
       const userContent = assembleCheckerContext({
         analyticsDir: this.paths.analyticsDir,
