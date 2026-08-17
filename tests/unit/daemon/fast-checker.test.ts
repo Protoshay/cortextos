@@ -563,6 +563,63 @@ describe('FastChecker', () => {
   });
 
   describe('handleCallback', () => {
+    it('consumes an exact FENSA approval once after the allowed human approves', async () => {
+      const api = createMockTelegramApi();
+      const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework', {
+        telegramApi: api,
+        chatId: '999',
+        allowedUserId: 1,
+      });
+      const hash = 'a'.repeat(64);
+      const id = checker.registerFensaApproval(hash, 9);
+
+      expect(checker.consumeFensaApproval(hash, 9)).toBe(false);
+      await checker.handleCallback(createCallbackQuery(`fensa_allow_${id}`));
+      expect(checker.consumeFensaApproval('b'.repeat(64), 9)).toBe(false);
+      expect(checker.consumeFensaApproval(hash, 10)).toBe(false);
+      expect(checker.consumeFensaApproval(hash, 9)).toBe(true);
+      expect(checker.consumeFensaApproval(hash, 9)).toBe(false);
+    });
+
+    it('does not approve FENSA payloads from a different Telegram user', async () => {
+      const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework', {
+        telegramApi: createMockTelegramApi(),
+        chatId: '999',
+        allowedUserId: 1,
+      });
+      const hash = 'c'.repeat(64);
+      const id = checker.registerFensaApproval(hash, 11);
+      await checker.handleCallback(createCallbackQuery(`fensa_allow_${id}`, {
+        from: { id: 2, first_name: 'Wrong user' },
+      }));
+      expect(checker.consumeFensaApproval(hash, 11)).toBe(false);
+    });
+
+    it('deletes a held FENSA approval instead of making it consumable', async () => {
+      const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework', {
+        telegramApi: createMockTelegramApi(),
+        chatId: '999',
+        allowedUserId: 1,
+      });
+      const hash = 'd'.repeat(64);
+      const id = checker.registerFensaApproval(hash, 12);
+      await checker.handleCallback(createCallbackQuery(`fensa_deny_${id}`));
+      expect(checker.consumeFensaApproval(hash, 12)).toBe(false);
+    });
+
+    it('refuses an expired FENSA approval even after it was approved', async () => {
+      const checker = new FastChecker(createMockAgent(), paths, '/tmp/framework', {
+        telegramApi: createMockTelegramApi(),
+        chatId: '999',
+        allowedUserId: 1,
+      });
+      const hash = 'e'.repeat(64);
+      const id = checker.registerFensaApproval(hash, 13);
+      await checker.handleCallback(createCallbackQuery(`fensa_allow_${id}`));
+      (checker as any).fensaApprovals.get(id).expiresAt = Date.now() - 1;
+      expect(checker.consumeFensaApproval(hash, 13)).toBe(false);
+    });
+
     it('perm_allow writes correct response file', async () => {
       const agent = createMockAgent();
       const api = createMockTelegramApi();
