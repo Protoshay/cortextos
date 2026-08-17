@@ -637,6 +637,8 @@ export type IPCCommandType =
   | 'fleet-health'
   /** Gate-checked human-facing Telegram send. Handled asynchronously by TelegramSendService. */
   | 'send-human-message'
+  | 'request-fensa-approval'
+  | 'consume-fensa-approval'
   /** Amendment: gate activity-channel sends through the daemon-owned activityApi. */
   | 'send-activity-message';
 

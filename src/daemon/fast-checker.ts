@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, existsSync, writeFileSync, unlinkSync, statSync } from 'fs';
 import { join } from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { hardRestart } from '../bus/system.js';
 import type { InboxMessage, BusPaths, TelegramMessage, TelegramCallbackQuery } from '../types/index.js';
 import { checkInbox, ackInbox } from '../bus/message.js';
@@ -65,6 +65,42 @@ export class FastChecker {
   private allowedUserId?: number;
   /** Daemon-owned send service — used for sendDirect() calls from lines 982, 1220. */
   private sendService?: TelegramSendService;
+  private fensaApprovals: Map<string, {
+    payloadHash: string;
+    seq: number;
+    expiresAt: number;
+    approved: boolean;
+    approvedBy?: number;
+  }> = new Map();
+
+  registerFensaApproval(payloadHash: string, seq: number): string {
+    if (!/^[a-f0-9]{64}$/.test(payloadHash) || !Number.isInteger(seq) || seq < 1) {
+      throw new Error('Invalid FENSA approval payload');
+    }
+    const id = randomBytes(8).toString('hex');
+    this.fensaApprovals.set(id, {
+      payloadHash,
+      seq,
+      expiresAt: Date.now() + 30 * 60_000,
+      approved: false,
+    });
+    return id;
+  }
+
+  consumeFensaApproval(payloadHash: string, seq: number): boolean {
+    const now = Date.now();
+    for (const [id, approval] of this.fensaApprovals) {
+      if (approval.expiresAt < now) {
+        this.fensaApprovals.delete(id);
+        continue;
+      }
+      if (approval.approved && approval.payloadHash === payloadHash && approval.seq === seq) {
+        this.fensaApprovals.delete(id);
+        return true;
+      }
+    }
+    return false;
+  }
 
   // External Telegram handler (set by daemon)
   private telegramMessages: Array<{ formatted: string; ackIds: string[] }> = [];
@@ -717,6 +753,35 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
         this.log(`SECURITY: callback from unauthorized user ${fromUserId} - rejecting`);
         return;
       }
+    }
+
+    const fensaMatch = data.match(/^fensa_(allow|deny)_([a-f0-9]{16})$/);
+    if (fensaMatch) {
+      const [, decision, approvalId] = fensaMatch;
+      const approval = this.fensaApprovals.get(approvalId);
+      if (!approval || approval.expiresAt < Date.now()) {
+        this.fensaApprovals.delete(approvalId);
+        if (this.telegramApi) {
+          try { await this.telegramApi.answerCallbackQuery(callbackQueryId, 'Approval expired'); } catch { /* ignore */ }
+        }
+        return;
+      }
+      if (decision === 'deny') {
+        this.fensaApprovals.delete(approvalId);
+      } else {
+        approval.approved = true;
+        approval.approvedBy = query.from?.id;
+      }
+      if (this.telegramApi) {
+        try { await this.telegramApi.answerCallbackQuery(callbackQueryId, decision === 'allow' ? 'Approved' : 'Held'); } catch { /* ignore */ }
+        if (chatId && messageId) {
+          const label = decision === 'allow'
+            ? `Approved: FENSA job ${approval.seq}`
+            : `Held: FENSA job ${approval.seq}`;
+          try { await this.telegramApi.editMessageText(chatId, messageId, label); } catch { /* ignore */ }
+        }
+      }
+      return;
     }
 
     // Approval callbacks: appr_(allow|deny)_{approvalId}

@@ -1095,6 +1095,58 @@ busCommand
   });
 
 busCommand
+  .command('request-fensa-approval')
+  .description('Ask the configured human to approve one exact FENSA filing payload')
+  .argument('<chat-id>', 'Approving human Telegram chat ID')
+  .argument('<seq>', 'FENSA queue sequence')
+  .argument('<payload-hash>', 'SHA-256 of the canonical filing payload')
+  .argument('<payload-json>', 'Canonical filing payload JSON; daemon renders the approval card')
+  .action(async (chatId: string, seqRaw: string, payloadHash: string, payloadJson: string) => {
+    const env = resolveEnv();
+    if (!env.agentName) throw new Error('CTX_AGENT_NAME is required');
+    const seq = Number(seqRaw);
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(payloadJson);
+    } catch {
+      console.error('payload-json must be valid JSON');
+      process.exit(1);
+    }
+    const ipc = new IPCClient(env.instanceId || 'default');
+    const resp = await ipc.send({
+      type: 'request-fensa-approval',
+      agent: env.agentName,
+      data: { chatId, seq, payloadHash, payload },
+    });
+    if (!resp.success) {
+      console.error(resp.error ?? 'FENSA approval request failed');
+      process.exit(1);
+    }
+    console.log(JSON.stringify(resp.data));
+  });
+
+busCommand
+  .command('consume-fensa-approval')
+  .description('Consume a one-use first-party approval for an exact FENSA payload')
+  .argument('<seq>', 'FENSA queue sequence')
+  .argument('<payload-hash>', 'SHA-256 of the canonical filing payload')
+  .action(async (seqRaw: string, payloadHash: string) => {
+    const env = resolveEnv();
+    if (!env.agentName) throw new Error('CTX_AGENT_NAME is required');
+    const ipc = new IPCClient(env.instanceId || 'default');
+    const resp = await ipc.send({
+      type: 'consume-fensa-approval',
+      agent: env.agentName,
+      data: { seq: Number(seqRaw), payloadHash },
+    });
+    if (!resp.success) {
+      console.error(resp.error ?? 'FENSA approval missing');
+      process.exit(1);
+    }
+    console.log('FENSA approval consumed');
+  });
+
+busCommand
   .command('create-approval')
   .description('Request human approval for a high-stakes action')
   .argument('<title>', 'What you are requesting approval for')

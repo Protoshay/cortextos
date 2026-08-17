@@ -1,6 +1,7 @@
 import { createServer, Server, Socket } from 'net';
 import { existsSync, unlinkSync, chmodSync, readFileSync } from 'fs';
 import { join, resolve as pathResolve } from 'path';
+import { createHash } from 'crypto';
 import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '../types/index.js';
 import { AgentManager } from './agent-manager.js';
 import type { HumanSendRequest } from './telegram-send-service.js';
@@ -926,6 +927,87 @@ export class IPCServer {
                   result.rejection?.reason ?? result.error ?? 'Send rejected',
                 data: { rewrite: result.rejection?.rewrite },
               };
+          break;
+        }
+
+        case 'request-fensa-approval': {
+          const d = request.data as { chatId?: string; payloadHash?: string; seq?: number; payload?: Record<string, unknown> } | undefined;
+          if (!request.agent || !d?.chatId || !d?.payloadHash || !Number.isInteger(d.seq) || !d.payload) {
+            response = { success: false, error: 'request-fensa-approval requires agent, chatId, payloadHash, seq, and payload' };
+            break;
+          }
+          if (request.agent !== 'rocky' || d.chatId !== '8915751414') {
+            response = { success: false, error: 'FENSA filing approval is scoped to Rocky and Shab' };
+            break;
+          }
+          const checker = this.agentManager.getFastChecker(request.agent);
+          const svc = this.agentManager.getTelegramSendService(request.agent);
+          if (!checker || !svc) {
+            response = { success: false, error: `Agent '${request.agent}' is not running` };
+            break;
+          }
+          try {
+            const stable = (value: unknown): string => {
+              if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+              if (value && typeof value === 'object') {
+                const obj = value as Record<string, unknown>;
+                return `{${Object.keys(obj).sort().map((key) => `${JSON.stringify(key)}:${stable(obj[key])}`).join(',')}}`;
+              }
+              return JSON.stringify(value);
+            };
+            const computedHash = createHash('sha256').update(stable(d.payload)).digest('hex');
+            if (computedHash !== d.payloadHash || d.payload.seq !== d.seq) {
+              response = { success: false, error: 'FENSA approval payload hash or sequence mismatch' };
+              break;
+            }
+            const p = d.payload as Record<string, any>;
+            const address = p.address as Record<string, string> | undefined;
+            // Approval visibility invariant: render every field that can affect the
+            // homeowner certificate. Installer-side constants may remain hidden;
+            // if a new customer-facing payload field is added, add it to this card.
+            const text = [
+              `Certificate job ${d.seq} — exact filing approval`,
+              `${p.customer_name}`,
+              `${address?.AddressLine1 ?? ''}, ${address?.Postcode ?? ''}`,
+              `Completed ${p.completion}; value £${Number(p.contract_value_vat_inc).toFixed(2)}`,
+              `${p.windows} windows; ${p.doors_over50} doors over 50% glass; ${p.doors_under50} doors under 50% glass`,
+              `Reference: ${p.installer_reference || '(none)'}`,
+            ].join('\n');
+            const approvalId = checker.registerFensaApproval(d.payloadHash, d.seq as number);
+            const result = await svc.handleSendRequest({
+              agentName: request.agent,
+              chatId: d.chatId,
+              text,
+              replyMarkup: { inline_keyboard: [[
+                { text: 'Approve filing', callback_data: `fensa_allow_${approvalId}` },
+                { text: 'Hold', callback_data: `fensa_deny_${approvalId}` },
+              ]] },
+              source: 'cli',
+            });
+            response = result.ok
+              ? { success: true, data: { approvalId, sentMessageId: result.sentMessageId } }
+              : { success: false, error: result.rejection?.reason ?? result.error ?? 'Approval request rejected' };
+          } catch (err) {
+            response = { success: false, error: err instanceof Error ? err.message : String(err) };
+          }
+          break;
+        }
+
+        case 'consume-fensa-approval': {
+          const d = request.data as { payloadHash?: string; seq?: number } | undefined;
+          if (!request.agent || !d?.payloadHash || !Number.isInteger(d.seq)) {
+            response = { success: false, error: 'consume-fensa-approval requires agent, payloadHash, and seq' };
+            break;
+          }
+          if (request.agent !== 'rocky') {
+            response = { success: false, error: 'FENSA filing approval consumption is scoped to Rocky' };
+            break;
+          }
+          const checker = this.agentManager.getFastChecker(request.agent);
+          const consumed = checker?.consumeFensaApproval(d.payloadHash, d.seq as number) ?? false;
+          response = consumed
+            ? { success: true, data: { consumed: true } }
+            : { success: false, error: 'No live first-party approval matches this exact FENSA payload' };
           break;
         }
 
