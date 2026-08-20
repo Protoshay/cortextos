@@ -30,6 +30,7 @@ import {
   buildRecentEvidence,
   assembleCheckerContext,
   recordGeraldToldGateShadow,
+  detectTopicShift,
 } from '../../../src/telegram/checker.js';
 import type {
   ModelClient,
@@ -626,6 +627,193 @@ describe('assembleUserContent', () => {
       draftText: 'Draft.',
     });
     expect(content).not.toContain('Requested deliverable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5b. detectTopicShift — proactive new-topic vs stale/unrelated recentHistory
+//
+// Reproduces the first-party skiffy failure: at 2026-08-20T16:12:36Z and
+// 2026-08-20T16:26:44Z, a draft about an unrelated checker bug relayed from
+// scout over the agent bus was rejected with the IDENTICAL, stale, unrelated
+// rewrite ("The five post-install follow-up emails remain unsent...") because
+// buildRecentHistory only ever reflects the Telegram thread, which at that
+// moment was the resolved five-post-install-emails exchange.
+// (logs/skiffy/message-checker-audit.jsonl:143-144)
+// ---------------------------------------------------------------------------
+
+describe('detectTopicShift', () => {
+  const STALE_TELEGRAM_HISTORY =
+    'user: Leave the five post-install follow-up emails unsent for now. No action needed from you.\n' +
+    "skiffy: I'm continuing yesterday's priorities today. The five post-install follow-up emails will remain unsent, so you don't need to do anything.";
+
+  it('flags the live first-party repro draft (16:12:36Z) as a topic shift', () => {
+    const draft =
+      "Otis's checker rejected 3 drafts today, ~36min gap. Scout says you want the filter removed. " +
+      "Heads up: otis's code isn't mine to touch, by your own call. Let me know if you want me on it " +
+      'anyway, or have otis/scout loosen it directly.';
+    expect(detectTopicShift(draft, STALE_TELEGRAM_HISTORY)).toBe(true);
+  });
+
+  it('flags the live first-party repro draft (16:26:44Z) as a topic shift', () => {
+    const draft =
+      "Got it from scout - on the otis checker fix. Found the real issue: it's rejecting otis's honest " +
+      "updates because it can't tell fast-changing status apart from unproven claims. Building the fix " +
+      "now, will verify it's live and let you know.";
+    expect(detectTopicShift(draft, STALE_TELEGRAM_HISTORY)).toBe(true);
+  });
+
+  it('does not flag a draft that continues the same topic (shared vocabulary)', () => {
+    const history =
+      'user: is Sol back on?\notis: Kami and Sol are the only active agents; everyone else remains disabled.';
+    const draft =
+      'Sol is back on and running now. Kami and Sol are the only active agents; everyone else remains disabled.';
+    expect(detectTopicShift(draft, history)).toBe(false);
+  });
+
+  it('returns false when recentHistory is null (no prior history is not a topic shift)', () => {
+    expect(detectTopicShift('Anything at all.', null)).toBe(false);
+  });
+
+  it('returns false when either side has no extractable significant words', () => {
+    expect(detectTopicShift('ok', 'user: ok\nagent: ok')).toBe(false);
+    expect(detectTopicShift('A brand new unrelated topic here.', 'ok')).toBe(false);
+  });
+});
+
+describe('assembleUserContent — new-topic note', () => {
+  const STALE_TELEGRAM_HISTORY =
+    'user: Leave the five post-install follow-up emails unsent for now. No action needed from you.\n' +
+    "skiffy: I'm continuing yesterday's priorities today. The five post-install follow-up emails will remain unsent, so you don't need to do anything.";
+
+  it('adds an advisory note (and still includes Recent conversation in full) when the draft looks unrelated', () => {
+    const draft =
+      "Got it from scout - on the otis checker fix. Found the real issue: it's rejecting otis's honest " +
+      "updates because it can't tell fast-changing status apart from unproven claims.";
+    const content = assembleUserContent({
+      contextFlags: [],
+      triggeringText: null,
+      recentHistory: STALE_TELEGRAM_HISTORY,
+      draftText: draft,
+    });
+    expect(content).toContain('evaluate it as an independent topic');
+    expect(content).toContain('Recent conversation:\n' + STALE_TELEGRAM_HISTORY);
+    expect(content).toContain('Draft reply:\n' + draft);
+  });
+
+  it('does not add the note when the draft shares vocabulary with recentHistory', () => {
+    const history = 'user: is Sol back on?\notis: Sol is disabled right now.';
+    const draft = 'Sol is back on and running.';
+    const content = assembleUserContent({
+      contextFlags: [],
+      triggeringText: null,
+      recentHistory: history,
+      draftText: draft,
+    });
+    expect(content).not.toContain('evaluate it as an independent topic');
+  });
+
+  it('does not add the note when there is no prior history', () => {
+    const content = assembleUserContent({
+      contextFlags: [],
+      triggeringText: null,
+      recentHistory: null,
+      draftText: 'A brand new topic with no history at all.',
+    });
+    expect(content).not.toContain('evaluate it as an independent topic');
+  });
+
+  it('the new-topic note coexists with jargon context flags', () => {
+    const content = assembleUserContent({
+      contextFlags: ['potential jargon detected: "guardrail"'],
+      triggeringText: null,
+      recentHistory: STALE_TELEGRAM_HISTORY,
+      draftText: 'The guardrail caught something totally unrelated to that topic.',
+    });
+    expect(content).toContain('potential jargon');
+    expect(content).toContain('evaluate it as an independent topic');
+  });
+});
+
+describe('system prompts carry the new-topic rule', () => {
+  it('SHAY_SYSTEM_PROMPT instructs the reviewer not to anchor rewrites to an unrelated Recent conversation', () => {
+    const prompt = resolveAudience(SHAY).systemPrompt;
+    expect(prompt).toContain('evaluate it as its own topic');
+    expect(prompt).toContain("invent a rewrite anchored to Recent conversation's topic");
+  });
+
+  it('the new-topic rule also reaches the Otis pilot prompt (derived from SHAY_SYSTEM_PROMPT)', () => {
+    const prompt = resolveAudience(SHAY, 'otis').systemPrompt;
+    expect(prompt).toContain('evaluate it as its own topic');
+  });
+
+  it('DEFAULT_SYSTEM_PROMPT (non-Shay chats) carries an equivalent rule', () => {
+    const prompt = resolveAudience(OTHER).systemPrompt;
+    expect(prompt).toContain('evaluate it as its own topic');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5c. Regression: legitimate rejections (unproven claims, jargon) are unaffected
+//
+// The fix must not weaken the checks that were working as intended — see the
+// same-day otis rejections (logs/otis/message-checker-audit.jsonl, 15:05-16:09Z
+// on 2026-08-20) blocking premature "it's fixed" claims and internal jargon.
+// These are wiring-level regression checks: the mocked ModelClient stands in
+// for the real semantic judgment (as in the rest of this suite), and asserts
+// that on-topic drafts do NOT get the new-topic note, and that a semantic
+// reject/rewrite that stays on the draft's own topic still flows through
+// unchanged end to end.
+// ---------------------------------------------------------------------------
+
+describe('on-topic rejections remain unaffected by the new-topic note', () => {
+  it('an unproven "it is fixed" style claim against matching Recent conversation still rejects, on-topic', async () => {
+    const history =
+      'user: is Kami back on yet?\notis: Kami is disabled right now, still checking.';
+    const draft = 'Yes. I will manually restart Sol and restore Kami, then verify both.';
+    const content = assembleUserContent({
+      contextFlags: [],
+      triggeringText: null,
+      recentHistory: history,
+      draftText: draft,
+    });
+    // Shares "Kami" with Recent conversation — this is the literal continuation
+    // of the same thread, so it must NOT get the unrelated-topic note.
+    expect(content).not.toContain('evaluate it as an independent topic');
+
+    const profile = resolveAudience(SHAY);
+    const result = await runSemanticCheck(
+      profile,
+      content,
+      mockReject(
+        'It promises a future action instead of answering now.',
+        "I'm turning Sol back on now so you can ask him directly. You don't need to do anything.",
+      ),
+    );
+    expect(result.pass).toBe(false);
+    if (!result.pass) {
+      expect(result.rewrite).toContain('Sol');
+    }
+  });
+
+  it('a jargon-laden reply against on-topic history still rejects for jargon', async () => {
+    const text = 'The send path is open and the release hold is cleared.';
+    const det = runDeterministicChecks(SHAY, text, false);
+    expect(det.reject).toBeNull();
+    const content = assembleUserContent({
+      contextFlags: det.contextFlags,
+      triggeringText: null,
+      recentHistory: 'user: is it ready to ship?\nskiffy: still checking the release status.',
+      draftText: text,
+    });
+    expect(content).not.toContain('evaluate it as an independent topic');
+    const profile = resolveAudience(SHAY);
+    const result = await runSemanticCheck(
+      profile,
+      content,
+      mockReject('Jargon without request', 'Remove system terms.'),
+    );
+    expect(result.pass).toBe(false);
   });
 });
 

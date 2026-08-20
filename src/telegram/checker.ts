@@ -120,6 +120,13 @@ Rules for Shay:
   If a specific recent record directly supports the claim, do not reject merely
   because the conversation itself lacks the evidence. If no record supports it,
   reject the claim rather than inventing a different answer.
+- Recent conversation reflects only this Telegram thread, not everything the
+  agent legitimately needs to tell Shay, such as something relayed from
+  another agent that has never come up here. When the draft has no real
+  connection to Recent conversation, evaluate it as its own topic against
+  the rules above rather than rejecting it for not continuing the last
+  exchange. Never invent a rewrite anchored to Recent conversation's topic
+  when that topic has nothing to do with the draft.
 - PASS if it is a direct, honest, short answer that moves things forward.
 - PASS if the triggering inbound message confirms this is a requested deliverable.
 - PASS if context flags indicate jargon but the message is a requested technical brief.
@@ -134,6 +141,11 @@ Rules:
 - REJECT if it exposes internal system details without being asked for them.
 - REJECT if it claims a behaviour is fixed without real runtime evidence.
 - REJECT if a naturally short answer is padded unnecessarily.
+- Recent conversation reflects only this Telegram thread. When the draft has
+  no real connection to Recent conversation, evaluate it as its own topic
+  rather than rejecting it for not continuing the last exchange. Never
+  invent a rewrite anchored to Recent conversation's topic when that topic
+  has nothing to do with the draft.
 - PASS if it answers the human question directly.
 - PASS if the triggering inbound message confirms this is a requested deliverable.
 Return {"pass":true,"reason":null,"rewrite":null}
@@ -484,6 +496,72 @@ export async function runSemanticCheck(
 }
 
 // ---------------------------------------------------------------------------
+// New-topic detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Small stopword list for detectTopicShift. Only needs to cover common words
+ * that are 4+ chars (the tokenizer already drops anything shorter) and would
+ * otherwise create a false "shared topic" signal between two genuinely
+ * unrelated messages.
+ */
+const TOPIC_SHIFT_STOPWORDS = new Set([
+  'this', 'that', 'with', 'from', 'your', 'need', 'know', 'just', 'been',
+  'they', 'them', 'then', 'than', 'what', 'when', 'where', 'which', 'about',
+  'there', 'here', 'still', 'also', 'into', 'only', 'some', 'more', 'send',
+  'sent', 'message', 'draft', 'will', 'have', 'want', 'like', 'good', 'today',
+  'told', 'said', 'right', 'sure', 'okay', 'yeah', 'done', 'thing', 'things',
+]);
+
+function tokenizeForTopicShift(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length >= 4 && !TOPIC_SHIFT_STOPWORDS.has(w)),
+  );
+}
+
+/**
+ * Heuristic, advisory-only detector for "this draft is probably not a
+ * continuation of Recent conversation."
+ *
+ * `recentHistory` (buildRecentHistory) only ever reflects the Telegram
+ * thread — it has zero visibility into topics an agent legitimately needs
+ * to relay from elsewhere (most commonly the internal agent-to-agent bus).
+ * When a draft on one of those topics is checked against a stale, unrelated
+ * `recentHistory`, the semantic reviewer has no signal that it should judge
+ * the draft on its own merits rather than forcing a rewrite anchored to
+ * whatever topic Recent conversation happens to contain.
+ *
+ * Deliberately conservative: returns true only when both texts have
+ * extractable significant words and share none of them. A false negative
+ * just leaves today's behaviour unchanged; a false positive only adds an
+ * advisory note ahead of the (still fully included) Recent conversation
+ * text, so the model can disregard it if the content is, in fact, related.
+ */
+export function detectTopicShift(draftText: string, recentHistory: string | null): boolean {
+  if (!recentHistory) return false;
+  const draftWords = tokenizeForTopicShift(draftText);
+  const historyWords = tokenizeForTopicShift(recentHistory);
+  if (draftWords.size === 0 || historyWords.size === 0) return false;
+  for (const word of draftWords) {
+    if (historyWords.has(word)) return false;
+  }
+  return true;
+}
+
+/** Advisory note injected into the checker's user content when detectTopicShift fires. */
+const NEW_TOPIC_NOTE =
+  "Note: Recent conversation below reflects only this Telegram thread, not everything " +
+  "the agent legitimately needs to relay (for example, something surfaced by another " +
+  "agent that has never come up here). This draft shares no obvious subject-matter " +
+  "with Recent conversation — evaluate it as an independent topic on its own merits. " +
+  "Do not select or invent a rewrite that recites or is anchored to Recent " +
+  "conversation's topic; any rewrite must address this draft's own subject.";
+
+// ---------------------------------------------------------------------------
 // User content assembly
 // ---------------------------------------------------------------------------
 
@@ -502,6 +580,10 @@ export function assembleUserContent(opts: {
 
   if (opts.contextFlags.length > 0) {
     parts.push(opts.contextFlags.join('\n'));
+  }
+
+  if (detectTopicShift(opts.draftText, opts.recentHistory)) {
+    parts.push(NEW_TOPIC_NOTE);
   }
 
   if (opts.triggeringText) {
