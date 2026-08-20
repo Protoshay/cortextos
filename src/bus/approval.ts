@@ -215,6 +215,7 @@ export async function createApproval(
     updated_at: now,
     resolved_at: null,
     resolved_by: null,
+    resolution_note: null,
   };
 
   const pendingDir = join(paths.approvalDir, 'pending');
@@ -242,9 +243,26 @@ export async function createApproval(
 /**
  * Update an approval's status (approve or deny).
  * Notifies the requesting agent via inbox message.
+ *
+ * `actor` is who RESOLVED the approval — an agent name for CLI-driven
+ * resolutions, or a human descriptor (e.g. "Alice (@alice)") for
+ * Telegram-button resolutions. It sits second, matching the `updateTask`
+ * fix (src/bus/task.ts), so that a stale positional call fails loudly
+ * instead of quietly filing free text as the actor: with `actor` in
+ * position 2, an un-migrated call maps the approval id into `actor`, the
+ * status literal into `approvalId` (no such file → throws), and — since
+ * `status` is a narrow literal union, not `string` — the old third
+ * positional argument fails to type-check against it, so a stale call
+ * additionally fails to compile.
+ *
+ * `note` is separate, optional, free-text context about the resolution
+ * (e.g. "via Telegram activity channel"). It is never written into
+ * `resolved_by` — see the doc comment on `Approval.resolved_by` for why
+ * that overload was a bug.
  */
 export function updateApproval(
   paths: BusPaths,
+  actor: string,
   approvalId: string,
   status: ApprovalStatus,
   note?: string,
@@ -258,7 +276,8 @@ export function updateApproval(
     approval.status = status;
     approval.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     approval.resolved_at = approval.updated_at;
-    approval.resolved_by = note || null;
+    approval.resolved_by = actor || null;
+    approval.resolution_note = note || null;
 
     // Move to resolved/ directory (matches bash version)
     const destDir = join(paths.approvalDir, 'resolved');
@@ -272,7 +291,7 @@ export function updateApproval(
     // Notify requesting agent via inbox
     if (approval.requesting_agent) {
       const noteText = note ? ` Note: ${note}` : '';
-      const msg = `Approval decision: ${status.toUpperCase()}\napproval_id: ${approvalId}\ndecision: ${status}${noteText}`;
+      const msg = `Approval decision: ${status.toUpperCase()}\napproval_id: ${approvalId}\ndecision: ${status}\nresolved_by: ${actor}${noteText}`;
       sendMessage(paths, 'system', approval.requesting_agent, 'urgent', msg);
     }
   } catch (err) {

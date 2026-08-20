@@ -381,14 +381,15 @@ describe('createApproval — agent-bot Telegram ping (closes 50h+ Repo-B-style s
 });
 
 describe('updateApproval (regression guard for activity-channel callback path)', () => {
-  it('moves the approval file from pending/ to resolved/ with status+note', async () => {
-    // The handleActivityCallback path calls updateApproval with an audit
-    // note ("via Telegram activity channel by <user>"). This test
-    // regression-guards that updateApproval still produces the exact file
-    // shape (move + status + resolved_by note) that the rest of the
-    // system expects downstream.
+  it('moves the approval file from pending/ to resolved/ with status+actor+note', async () => {
+    // The handleActivityCallback path calls updateApproval with the
+    // resolving Telegram user as the actor and a separate free-text note
+    // ("via Telegram activity channel"). This test regression-guards that
+    // updateApproval still produces the exact file shape (move + status +
+    // resolved_by actor + resolution_note) that the rest of the system
+    // expects downstream.
     const id = await createApproval(paths, 'alice', 'TestOrg', 'Test resolve', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id, 'approved', 'via Telegram activity channel by Alice (@alice)');
+    updateApproval(paths, 'Alice (@alice)', id, 'approved', 'via Telegram activity channel');
 
     const pendingFile = join(paths.approvalDir, 'pending', `${id}.json`);
     const resolvedFile = join(paths.approvalDir, 'resolved', `${id}.json`);
@@ -397,12 +398,16 @@ describe('updateApproval (regression guard for activity-channel callback path)',
 
     const approval = JSON.parse(readFileSync(resolvedFile, 'utf-8'));
     expect(approval.status).toBe('approved');
-    expect(approval.resolved_by).toBe('via Telegram activity channel by Alice (@alice)');
+    // resolved_by is the ACTOR — not the free-text note. This is the
+    // regression the fix guards: the two used to be the same overloaded
+    // field, and this pins them apart.
+    expect(approval.resolved_by).toBe('Alice (@alice)');
+    expect(approval.resolution_note).toBe('via Telegram activity channel');
     expect(approval.resolved_at).toBeTruthy();
   });
 
   it('throws a clear error when the approval id does not exist', () => {
-    expect(() => updateApproval(paths, 'approval_999_nope', 'approved')).toThrow(/not found/);
+    expect(() => updateApproval(paths, 'alice', 'approval_999_nope', 'approved')).toThrow(/not found/);
   });
 });
 
@@ -410,7 +415,7 @@ describe('listPendingApprovals', () => {
   it('returns only approvals still in pending/ (not resolved)', async () => {
     const id1 = await createApproval(paths, 'alice', 'TestOrg', 'Still pending', 'deployment', undefined, frameworkRoot);
     const id2 = await createApproval(paths, 'alice', 'TestOrg', 'Will be resolved', 'deployment', undefined, frameworkRoot);
-    updateApproval(paths, id2, 'approved');
+    updateApproval(paths, 'alice', id2, 'approved');
 
     const pending = listPendingApprovals(paths);
     expect(pending).toHaveLength(1);

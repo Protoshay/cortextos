@@ -1184,7 +1184,7 @@ busCommand
     }
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
-    updateApproval(paths, id, status as ApprovalStatus, note);
+    updateApproval(paths, env.agentName, id, status as ApprovalStatus, note);
     console.log(`Approval ${id} -> ${status}`);
   });
 

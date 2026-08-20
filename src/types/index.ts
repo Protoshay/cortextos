@@ -133,7 +133,23 @@ export interface Approval {
   created_at: string;
   updated_at: string;
   resolved_at: string | null;
+  /**
+   * WHO resolved the approval — an actor identity (agent name, or a human
+   * descriptor like "Alice (@alice)" for Telegram-button resolutions).
+   * Never free-text prose about the resolution; that belongs in
+   * `resolution_note`.
+   *
+   * ⛔ RECORDS RESOLVED BEFORE 2026-08-20 CANNOT BE TRUSTED FOR THIS FIELD.
+   * `updateApproval`'s `note` parameter (free-text, e.g. "safe default
+   * applied, Shab never confirmed") was written directly into `resolved_by`
+   * pre-fix — 0 of 8 resolved records audited had an actor-shaped value here,
+   * all 8 were prose. Nothing distinguishes an old row from a new one, and
+   * the true resolving actor is not recoverable from the file, so historical
+   * attribution on this field is lost rather than wrong-but-fixable.
+   */
   resolved_by: string | null;
+  /** Free-text context supplied by the resolver, e.g. "via Telegram activity channel". */
+  resolution_note: string | null;
 }
 
 // Agent Config Types (config.json)
