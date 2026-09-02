@@ -1243,7 +1243,20 @@ Reply using: cortextos bus send-telegram ${chatId} '<your reply>'
       // persistCtxHandoffDeadline doc comment for why this matters).
       this.persistCtxHandoffDeadline(effectivePct);
       const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + 'Z';
-      const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. Then run: cortextos bus hard-restart --reason "context handoff at ${Math.round(effectivePct)}%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
+      // This order deliberately carries NO current-context figure, and points at the actuator
+      // instead. A percentage interpolated here is a literal fixed at write time, and Tier 2
+      // fires on high context — the same condition that triggers compaction — so the two are
+      // armed by the same trigger and the quoted reading is systematically, not coincidentally,
+      // likely to be invalidated before the agent finishes acting on it.
+      //
+      // The pointer must also name its own decoy. The reset write above sets used_percentage to
+      // 0 with only three fields, and it runs BEFORE this injection — so a re-read taken promptly
+      // after the order lands can return 0%, which a naive reader takes for a full recovery. That
+      // would decline a genuine order and run the session to real exhaustion: the worse failure
+      // direction. hook-context-status.ts writes six fields (session_id and current_usage among
+      // them); the reset writes three. Key presence, not value, tells them apart — a genuine 0
+      // still carries session_id, so this cannot misfire on a real low reading.
+      const handoffPrompt = `[CONTEXT HANDOFF REQUIRED] Write a handoff document to memory/handoffs/handoff-${ts}.md with these sections: ## Current Tasks, ## Next Actions, ## Active Crons, ## Key Context, ## Files Modified This Session. This order carries no context percentage on purpose: any figure quoted here can go stale while you act on it. IMMEDIATELY BEFORE you restart — not once at the start — re-read ${statusPath} and decide from that reading. IGNORE any record lacking the session_id and current_usage fields: that is this daemon's own reset write, not a measurement, and its 0 is not a low reading. If the re-read is below ${handoff}%, context has recovered: keep the handoff document and do NOT restart. Otherwise run: cortextos bus hard-restart --reason "context handoff at <the percentage you just read>%" --handoff-doc <absolute path to the handoff doc you just wrote>. Do this NOW before the context window is exhausted.`;
       this.agent.injectMessage(handoffPrompt, 'system');
       this.log(`Handoff prompt injected at ${Math.round(effectivePct)}%`);
       // Pre-arm .force-fresh so the next restart is always a clean fresh session.

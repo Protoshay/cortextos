@@ -1182,3 +1182,131 @@ describe('context handoff gate — codex runtime class exclusion', () => {
   });
 });
 });
+
+/**
+ * The Tier 2 order used to interpolate the live context reading:
+ *   `[CONTEXT HANDOFF REQUIRED] Context is at ${Math.round(effectivePct)}%. ...`
+ *
+ * That figure is a literal fixed at write time. Tier 2 fires on high context, which is also what
+ * triggers compaction, so the order and the event that invalidates it are armed by the same
+ * trigger — the quoted number goes stale systematically rather than coincidentally. Measured over
+ * 1,634 injected orders (daemon log, 2026-08-06 → 2026-09-02): 937 (57.3%) ended with the daemon
+ * standing itself down because context had already recovered, median recovery 35% against an order
+ * that said 80%.
+ *
+ * These tests pin the replacement: no baked reading, an actuator pointer, and — critically — the
+ * discriminator for the daemon's OWN reset write, which lands one step before the injection and
+ * would otherwise read as a full recovery to anyone who believed the bare integer.
+ */
+describe('Tier 2 handoff order carries no baked context percentage', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-handoff-pct-test-'));
+    paths = createTestPaths(testDir);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  // A genuine hook reading: six fields, as written by hook-context-status.ts.
+  function writeRealReading(stateDir: string, pct: number): void {
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(
+      join(stateDir, 'context_status.json'),
+      JSON.stringify({
+        used_percentage: pct,
+        context_window_size: 200000,
+        exceeds_200k_tokens: false,
+        current_usage: { cache_creation_input_tokens: 1, cache_read_input_tokens: 2 },
+        session_id: 'sess-1',
+        written_at: new Date().toISOString(),
+      }),
+      'utf-8',
+    );
+  }
+
+  function fireTier2(pct: number, threshold = 80) {
+    const agentDir = join(testDir, 'agent-handoff');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(join(agentDir, 'config.json'), JSON.stringify({ ctx_handoff_threshold: threshold }));
+    const agent = createMockAgent('handoff-test', 'ordinary output');
+    agent.getConfig = vi.fn().mockReturnValue({ ctx_handoff_threshold: threshold });
+    agent.getAgentDir = vi.fn().mockReturnValue(agentDir);
+    writeRealReading(paths.stateDir, pct);
+    const checker = new FastChecker(agent, paths, '/tmp/framework');
+    return { agent, checker };
+  }
+
+  // Select the Tier 2 ORDER specifically, not every injected message. The Tier 1 warning
+  // ("[CONTEXT] Window at 87%. Handoff in progress.") is a different object and still carries a
+  // live figure by design: it reports a state and instructs no action, so a stale number there
+  // costs nothing. Joining both asserts against a message this change does not govern — which is
+  // what the first draft of this test did, and it failed for that reason rather than on the code.
+  function injectedText(agent: any): string {
+    const orders = (agent.injectMessage as any).mock.calls
+      .map((c: any[]) => String(c[0]))
+      .filter((m: string) => m.startsWith('[CONTEXT HANDOFF REQUIRED]'));
+    expect(orders).toHaveLength(1);
+    return orders[0];
+  }
+
+  it('does not quote the live reading that triggered it', async () => {
+    const { agent, checker } = fireTier2(87);
+    await (checker as any).checkContextStatus();
+
+    const order = injectedText(agent);
+    expect(order).toMatch(/CONTEXT HANDOFF REQUIRED/);
+    // The defect, stated as an assertion: the triggering reading must not appear in the order.
+    expect(order).not.toMatch(/Context is at/);
+    expect(order).not.toContain('87%');
+    // ...including in the --reason, which previously interpolated the same stale figure and
+    // carried it on into restarts.log as though it were a verified value.
+    expect(order).not.toMatch(/context handoff at 87%/);
+  });
+
+  it('points at the actuator and requires the re-read at the moment of acting', async () => {
+    const { agent, checker } = fireTier2(87);
+    await (checker as any).checkContextStatus();
+
+    const order = injectedText(agent);
+    expect(order).toContain(join(paths.stateDir, 'context_status.json'));
+    expect(order).toMatch(/IMMEDIATELY BEFORE you restart/);
+    // Re-reading is pointless unless the answer is allowed to cancel the restart.
+    expect(order).toMatch(/do NOT restart/);
+  });
+
+  it("names the daemon's own reset write so a 0 cannot be mistaken for a recovery", async () => {
+    const { agent, checker } = fireTier2(87);
+    await (checker as any).checkContextStatus();
+
+    const order = injectedText(agent);
+    // Key presence, not value: the reset write emits three fields and cannot forge these two,
+    // while a genuine low reading still carries them — so this cannot misfire on a real 0.
+    expect(order).toContain('session_id');
+    expect(order).toContain('current_usage');
+  });
+
+  it('still names the threshold, which is config and cannot go stale', async () => {
+    const { agent, checker } = fireTier2(87, 75);
+    await (checker as any).checkContextStatus();
+
+    // Without a threshold "has it recovered?" is undecidable. Unlike the triggering reading,
+    // the threshold is a constant read from config, so it is not subject to the staleness this
+    // change exists to remove.
+    expect(injectedText(agent)).toContain('75%');
+  });
+
+  it('still performs the reset write that Tier 3 depends on', async () => {
+    const { checker } = fireTier2(87);
+    await (checker as any).checkContextStatus();
+
+    // Guards the exclusion: this change is template text only. The daemon's own state handling
+    // is untouched.
+    const after = JSON.parse(readFileSync(join(paths.stateDir, 'context_status.json'), 'utf-8'));
+    expect(after.used_percentage).toBe(0);
+    expect(after.session_id).toBeUndefined();
+  });
+});
