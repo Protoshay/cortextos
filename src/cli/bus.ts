@@ -713,8 +713,20 @@ busCommand
     const { writeFileSync: fsWrite, existsSync: fsExists, mkdirSync: fsMkdir } = require('fs');
     const env = resolveEnv();
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
+    // A --handoff-doc that doesn't resolve must never be silently dropped: the
+    // caller explicitly asked for its handoff to survive the restart, and the
+    // session that would notice the drop is the one that never comes back to
+    // report it (task_1788862054035_41937914). Check BEFORE hardRestart() fires
+    // so a bad path refuses the whole restart instead of restarting anyway
+    // while quietly discarding the handoff — no markers written, no IPC sent,
+    // no "Hard restart triggered" success line.
+    if (opts.handoffDoc && !fsExists(opts.handoffDoc)) {
+      console.error(`ERROR: --handoff-doc path does not exist: ${opts.handoffDoc}`);
+      console.error('Refusing to restart — the handoff would be silently discarded. Fix the path and retry, or omit --handoff-doc to restart without one.');
+      process.exit(1);
+    }
     hardRestart(paths, env.agentName, opts.reason);
-    if (opts.handoffDoc && fsExists(opts.handoffDoc)) {
+    if (opts.handoffDoc) {
       fsMkdir(paths.stateDir, { recursive: true });
       fsWrite(join(paths.stateDir, '.handoff-doc-path'), opts.handoffDoc + '\n', 'utf-8');
     }
