@@ -8,7 +8,13 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, shouldNotifyHuman } from '../../../src/hooks/hook-crash-alert';
+import {
+  readMaxCrashesPerDay,
+  notifyAgents,
+  shouldNotifyHuman,
+  isAgentStillRunning,
+  type IpcStatusQuery,
+} from '../../../src/hooks/hook-crash-alert';
 
 describe('shouldNotifyHuman', () => {
   it.each([
@@ -18,6 +24,7 @@ describe('shouldNotifyHuman', () => {
     'user-disable',
     'user-stop',
     'daemon-stop',
+    'internal-continuation',
   ])('suppresses routine lifecycle chatter: %s', (endType) => {
     expect(shouldNotifyHuman(endType)).toBe(false);
   });
@@ -28,6 +35,50 @@ describe('shouldNotifyHuman', () => {
       expect(shouldNotifyHuman(endType)).toBe(true);
     },
   );
+});
+
+describe('isAgentStillRunning', () => {
+  function fakeIpc(response: { success: boolean; data?: unknown }): IpcStatusQuery {
+    return { send: vi.fn().mockResolvedValue(response) };
+  }
+
+  it('returns true when the daemon reports this agent as running', async () => {
+    const ipc = fakeIpc({
+      success: true,
+      data: [{ name: 'analyst', status: 'running' }, { name: 'chief', status: 'crashed' }],
+    });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(true);
+  });
+
+  it('returns false when the daemon reports this agent as crashed', async () => {
+    const ipc = fakeIpc({ success: true, data: [{ name: 'analyst', status: 'crashed' }] });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
+
+  it('returns false when the daemon reports this agent as starting (mid crash-recovery restart)', async () => {
+    const ipc = fakeIpc({ success: true, data: [{ name: 'analyst', status: 'starting' }] });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
+
+  it('returns false when the agent is not in the status list', async () => {
+    const ipc = fakeIpc({ success: true, data: [{ name: 'chief', status: 'running' }] });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
+
+  it('returns false when the IPC response is unsuccessful (daemon unreachable)', async () => {
+    const ipc = fakeIpc({ success: false });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
+
+  it('returns false when data is not an array', async () => {
+    const ipc = fakeIpc({ success: true, data: { name: 'analyst', status: 'running' } });
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
+
+  it('fails closed when send() throws (socket error, timeout)', async () => {
+    const ipc: IpcStatusQuery = { send: vi.fn().mockRejectedValue(new Error('IPC request timed out')) };
+    expect(await isAgentStillRunning('analyst', ipc)).toBe(false);
+  });
 });
 
 describe('readMaxCrashesPerDay', () => {

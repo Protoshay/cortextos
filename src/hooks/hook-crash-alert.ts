@@ -13,6 +13,17 @@
  *   - Deduplicates identical alerts for the same agent within 10 minutes so a
  *     broken watchdog loop results in at most one notification, not a buzz
  *     storm.
+ *   - Marker files (.restart-planned, .daemon-stop, etc.) only cover session
+ *     ends that THIS system planned — a marker is written by the daemon
+ *     BEFORE it triggers the restart. Claude Code can also end a session on
+ *     its own initiative (e.g. an internal context-compaction boundary) with
+ *     no cortextOS marker involved and no PTY exit at all. Before conceding
+ *     the default 'crash' classification, main() asks the daemon (via IPC)
+ *     whether it currently sees this agent's PTY as still 'running' — see
+ *     isAgentStillRunning for why that check is authoritative and fails
+ *     closed. [2026-09-08: analyst's own crashes.log logged 8x type=crash
+ *     while its stdout.log showed one continuous, unbroken conversation —
+ *     no restart, nothing in restarts.log.]
  */
 import { existsSync, readFileSync, writeFileSync, appendFileSync, unlinkSync, mkdirSync, statSync } from 'fs';
 import { join } from 'path';
@@ -34,6 +45,7 @@ const QUIET_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'rate-limited',
+  'internal-continuation',
 ]);
 
 const HUMAN_SUPPRESSED_TYPES = new Set([
@@ -43,6 +55,7 @@ const HUMAN_SUPPRESSED_TYPES = new Set([
   'user-disable',
   'user-stop',
   'daemon-stop',
+  'internal-continuation',
 ]);
 
 /** Routine lifecycle chatter stays in backend logs, never in human chat. */
@@ -162,6 +175,71 @@ function shouldSuppressDedup(stateDir: string, endType: string): boolean {
   return false;
 }
 
+interface SessionEndInput {
+  session_id?: string;
+  reason?: string;
+  transcript_path?: string;
+}
+
+/**
+ * Read Claude Code's native SessionEnd hook payload from stdin, mirroring the
+ * read pattern in hook-context-status.ts. Best-effort and bounded — if
+ * nothing arrives (e.g. invoked manually outside a real hook context) the
+ * timeout resolves with an empty payload rather than hanging.
+ */
+function readStdinPayload(): Promise<SessionEndInput> {
+  const chunks: Buffer[] = [];
+  return new Promise<SessionEndInput>((resolve) => {
+    const finish = () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as SessionEndInput);
+      } catch {
+        resolve({});
+      }
+    };
+    process.stdin.on('data', (chunk: Buffer) => chunks.push(chunk));
+    process.stdin.on('end', finish);
+    process.stdin.on('error', finish);
+    setTimeout(finish, 1000);
+  });
+}
+
+/** Minimal shape of IPCClient.send, so isAgentStillRunning can be unit-tested
+ * with a fake instead of mocking the daemon/ipc-server module. */
+export interface IpcStatusQuery {
+  send(request: { type: 'status' }): Promise<{ success: boolean; data?: unknown }>;
+}
+
+/**
+ * Ask the daemon whether it currently considers this agent's PTY alive.
+ *
+ * This is the tiebreaker for a SessionEnd that matched no cortextOS marker:
+ * if agent-process.ts's handleExit() had actually run (a real PTY exit), the
+ * daemon's tracked status would already be 'crashed' or 'starting' by the
+ * time this IPC round-trip completes, because handleExit() runs
+ * synchronously inside the PTY's onExit callback — well before this hook
+ * process (spawned by Claude Code's own shutdown sequence) can open a socket
+ * and get a reply. A 'running' answer only happens when nothing on the
+ * daemon side has reacted to any exit, because there wasn't one.
+ *
+ * Fails closed: any IPC error, timeout, unreachable daemon, or non-'running'
+ * status leaves the caller's existing classification untouched. This can
+ * only ever suppress a false alarm, never mask a real crash — an unreachable
+ * daemon and a genuine crash both resolve to `false` here.
+ */
+export async function isAgentStillRunning(agentName: string, ipc: IpcStatusQuery): Promise<boolean> {
+  try {
+    const response = await ipc.send({ type: 'status' });
+    if (!response.success || !Array.isArray(response.data)) return false;
+    const mine = (response.data as Array<{ name?: string; status?: string }>).find(
+      (s) => s.name === agentName,
+    );
+    return mine?.status === 'running';
+  } catch {
+    return false;
+  }
+}
+
 async function main(): Promise<void> {
   const agentName = process.env.CTX_AGENT_NAME;
   const instanceId = process.env.CTX_INSTANCE_ID || 'default';
@@ -215,6 +293,25 @@ async function main(): Promise<void> {
     }
   }
 
+  // Still unrecognized: read Claude Code's own SessionEnd payload (unused
+  // above — captured here for the daemon-liveness tiebreaker and for
+  // diagnostics) and ask the daemon if this agent's PTY is still running. See
+  // isAgentStillRunning for why a 'running' answer here can only downgrade a
+  // false alarm, never mask a real crash.
+  let nativeInput: SessionEndInput = {};
+  if (endType === 'crash') {
+    nativeInput = await readStdinPayload();
+    try {
+      const { IPCClient } = await import('../daemon/ipc-server.js');
+      if (await isAgentStillRunning(agentName, new IPCClient(instanceId))) {
+        endType = 'internal-continuation';
+        reason = nativeInput.reason
+          ? `claude-code session boundary (reason=${nativeInput.reason}), pty still running`
+          : 'claude-code session boundary, pty still running';
+      }
+    } catch { /* daemon unreachable — keep default crash classification */ }
+  }
+
   // Track crash count (real crashes only).
   const today = new Date().toISOString().split('T')[0];
   const countFile = join(stateDir, '.crash_count_today');
@@ -249,8 +346,14 @@ async function main(): Promise<void> {
   } catch { /* ignore */ }
 
   // Always log to crashes.log — we want visibility even when alerts are muted.
+  // hook_reason/hook_session surface Claude Code's own native SessionEnd
+  // payload (when present) so a future 'crash' that this hook still can't
+  // explain carries its own diagnostic breadcrumb instead of nothing.
   const timestamp = new Date().toISOString();
-  const logLine = `${timestamp} type=${endType} reason=${reason || 'none'} last_task=${lastTask}\n`;
+  const nativeSuffix = nativeInput.reason || nativeInput.session_id
+    ? ` hook_reason=${nativeInput.reason || 'none'} hook_session=${nativeInput.session_id || 'none'}`
+    : '';
+  const logLine = `${timestamp} type=${endType} reason=${reason || 'none'} last_task=${lastTask}${nativeSuffix}\n`;
   try {
     appendFileSync(join(logDir, 'crashes.log'), logLine);
   } catch { /* ignore */ }
