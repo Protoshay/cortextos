@@ -14,10 +14,12 @@
  * writer's `writeCrons` completed, so the second writer's snapshot was
  * stale and the rename overwrote the first writer's update.
  *
- * NOTE: this test invokes the compiled `dist/cli.js`, so the test
- * suite assumes `npm run build` ran beforehand (the CI workflow does
- * this).  If `dist/cli.js` is absent locally, the test is skipped with
- * a clear message rather than failing on a missing file.
+ * NOTE: this test invokes the compiled `dist/cli.js`, so the test suite
+ * requires `npm run build` to have run beforehand. The CI test job now
+ * receives `dist/` as a build artifact from the build job (see ci.yml)
+ * rather than building it itself. If `dist/cli.js` is absent locally,
+ * the test is skipped with a clear message rather than failing on a
+ * missing file.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
