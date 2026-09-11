@@ -12,6 +12,7 @@ const previous = {
   root: process.env.CTX_ROOT,
   agent: process.env.CTX_AGENT_NAME,
   org: process.env.CTX_ORG,
+  instanceId: process.env.CTX_INSTANCE_ID,
 };
 
 beforeEach(() => {
@@ -19,6 +20,12 @@ beforeEach(() => {
   process.env.CTX_ROOT = tmpRoot;
   process.env.CTX_AGENT_NAME = 'alice';
   process.env.CTX_ORG = 'acme';
+  // resolvePaths() builds ctxRoot from instanceId, not from CTX_ROOT - seedTask() below
+  // hardcodes resolvePaths('alice', 'default', 'acme'). Without pinning CTX_INSTANCE_ID here
+  // too, busCommand's own resolveEnv() picks up whatever CTX_INSTANCE_ID is set in the real
+  // environment (e.g. CI sets CTX_INSTANCE_ID=ci-test), landing on a different ctxRoot than
+  // the one seedTask() just wrote the task under - a mismatch invisible outside CI.
+  process.env.CTX_INSTANCE_ID = 'default';
 });
 
 afterEach(() => {
@@ -29,6 +36,8 @@ afterEach(() => {
   else process.env.CTX_AGENT_NAME = previous.agent;
   if (previous.org === undefined) delete process.env.CTX_ORG;
   else process.env.CTX_ORG = previous.org;
+  if (previous.instanceId === undefined) delete process.env.CTX_INSTANCE_ID;
+  else process.env.CTX_INSTANCE_ID = previous.instanceId;
   vi.restoreAllMocks();
 });
 
