@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readFileSync, renameSync, writeFileSync, unlinkSync, appendFileSync } from 'fs';
 import { join } from 'path';
+import { createHash } from 'crypto';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
@@ -280,10 +281,17 @@ export function updateTask(
     );
   }
   let prevStatus: TaskStatus | undefined;
+  let prevDesc: string | undefined;
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
+    // Captured BEFORE the overwrite below — this is the only point in the
+    // whole call chain where the outgoing description still exists. The CLI
+    // has already merged append-vs-replace into one final string by the time
+    // it calls us (see src/cli/bus.ts), so old-from-disk + new-from-parameter
+    // is the only way to reconstruct what the edit actually did.
+    prevDesc = task.description ?? '';
     task.status = status;
     if (desc !== undefined) task.description = desc;
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
@@ -291,7 +299,65 @@ export function updateTask(
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: actor || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, {
+    event: 'update',
+    agent: actor || 'unknown',
+    from: prevStatus,
+    to: status,
+    // Spread, not assignment: a status-only update must leave these keys
+    // ABSENT. See describeDescriptionChange for why a zero default is unsafe.
+    ...describeDescriptionChange(prevDesc, desc),
+  });
+}
+
+/**
+ * Length of the truncated sha256 prefix stored in an audit entry. Twelve hex
+ * characters (48 bits) is not a collision-proof identity — it is a change
+ * DETECTOR, read only by comparing two values recorded seconds apart.
+ */
+const DESC_HASH_PREFIX_LENGTH = 12;
+
+function shortDescHash(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex').slice(0, DESC_HASH_PREFIX_LENGTH);
+}
+
+/**
+ * Build the description content-signal fields for an `update` audit entry.
+ *
+ * ⛔ WHY THIS EXISTS: before it, an audit row recorded status transitions and
+ * NOTHING ELSE, so a description APPEND and a destructive `--replace-desc`
+ * OVERWRITE produced BYTE-IDENTICAL rows — typically
+ * `{"event":"update","from":"pending","to":"pending"}`, a no-op status
+ * transition carrying zero information about the several thousand characters
+ * that had just been thrown away. The audit log is exactly where an operator
+ * looks to detect silent data loss, and it structurally could not show it.
+ *
+ * Both length AND hash are recorded on purpose. A length delta alone is blind
+ * to equal-length substitution (the whole description swapped for different
+ * text of the same size reads as "no change"); a hash alone says something
+ * changed but not whether content grew or was destroyed. Together they
+ * distinguish append (hash changed, length grew) from overwrite (hash changed,
+ * length collapsed or held) without storing the description itself.
+ *
+ * Returns an EMPTY object when no description was passed. The fields must be
+ * ABSENT rather than 0/'' for a status-only update: a zero length would read
+ * as "the description was destroyed", which is the alarming direction — a
+ * reader auditing for data loss would find a false positive on every ordinary
+ * status change, and a detector that cries wolf on the common case is worse
+ * than no detector at all.
+ */
+function describeDescriptionChange(
+  before: string | undefined,
+  after: string | undefined,
+): Pick<TaskAuditEntry, 'desc_len_before' | 'desc_len_after' | 'desc_hash_before' | 'desc_hash_after'> {
+  if (after === undefined) return {};
+  const prev = before ?? '';
+  return {
+    desc_len_before: prev.length,
+    desc_len_after: after.length,
+    desc_hash_before: shortDescHash(prev),
+    desc_hash_after: shortDescHash(after),
+  };
 }
 
 /**
@@ -319,6 +385,26 @@ export interface TaskAuditEntry {
   from?: TaskStatus;
   to?: TaskStatus;
   note?: string;
+  /**
+   * Description content signal, written by `update` events ONLY and ONLY when
+   * that update actually carried a description. All four are absent together
+   * on a status-only update — never zero, never '' — because a recorded length
+   * of 0 is indistinguishable from a description that was wiped.
+   *
+   * They exist because a status transition alone cannot tell an APPEND from a
+   * destructive `--replace-desc` OVERWRITE: both emitted the same row. See
+   * describeDescriptionChange for the full rationale and why both the lengths
+   * and the hashes are needed.
+   *
+   * ⛔ ABSENT ON EVERY ROW WRITTEN BEFORE 2026-09-11, and on every `create`,
+   * `claim` and `complete` row regardless of date. Absence here therefore means
+   * "not recorded", NEVER "no description change occurred" — do not read an
+   * old row as evidence that a task's description was untouched.
+   */
+  desc_len_before?: number;
+  desc_len_after?: number;
+  desc_hash_before?: string;
+  desc_hash_after?: string;
 }
 
 /**
