@@ -781,13 +781,15 @@ busCommand
   .option('--surface <path>', 'Surface file path')
   .option('--direction <dir>', 'Direction: higher or lower', 'higher')
   .option('--window <dur>', 'Measurement window', '24h')
-  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string }) => {
+  .requiredOption('--baseline <value>', 'Real pre-experiment baseline for this metric — required, no default')
+  .action(async (metric: string, hypothesis: string, opts: { surface?: string; direction?: string; window?: string; baseline: string }) => {
     const env = resolveEnv();
     const agentDir = env.agentDir || process.cwd();
     const id = createExperiment(agentDir, env.agentName, metric, hypothesis, {
       surface: opts.surface,
       direction: opts.direction as 'higher' | 'lower',
       window: opts.window,
+      baseline_value: parseFloat(opts.baseline),
     });
     console.log(id);
 
