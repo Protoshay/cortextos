@@ -28,6 +28,139 @@ Complete the following in order. Do not skip steps.
 2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
    - TOOLS.md is a compact command index — load the relevant skill (e.g. `tasks/SKILL.md`, `comms/SKILL.md`) when you need full docs for a workflow
 3. Read org knowledge base: `../../knowledge.md` (shared facts all agents need)
+   Also read `../../MISTAKES_LOG.md` — the org-wide mistakes log, so a mistake logged by one agent teaches the whole
+   fleet. **READ THE TAIL ONLY. NEVER from line 1. No read-offset ⇒ read the TAIL.**
+
+   ⛔ **BOUND THE ENTRIES STRUCTURALLY; LET THE BYTES BE DERIVED. RUN THIS FUNCTION; DO NOT RE-DERIVE IT.**
+   ⛔ **THE OLD BOUND WAS IN LINES, AND A LINE BOUND CANNOT BOUND A BYTE BUDGET — lines have variable length.** That
+   is the entire argument, it is true **a priori**, and it holds for every file that ever existed. **It needs no
+   measurement to support it, and any measurement offered for it will rot while the argument will not.** `tail -c`
+   **cannot overshoot**; and the window is now cut at a MEASURED header offset, so the ENTRY COUNT is what
+   is structural while the byte window is derived and merely reported.
+   ```bash
+   mistakes_tail() {                      # stdout = the window. stderr = measurements + refusals.
+     local F="../../MISTAKES_LOG.md" WANT="${1:-3}" HARDCAP="${2:-65536}"
+     [ -r "$F" ] || { echo "ABORT: unreadable $F" >&2; return 1; }
+     local SZ N OFF BYTES
+     SZ=$(wc -c <"$F"); N=$(grep -c '^### 20' "$F")
+     [ "$N" -ge "$WANT" ] || { echo "ABORT: file holds $N entries < want $WANT" >&2; return 1; }
+     OFF=$(grep -b '^### 20' "$F" | tail -n "$WANT" | head -1 | cut -d: -f1)
+     BYTES=$((SZ - OFF))
+     echo "[mistakes_tail] file=${SZ}B entries_total=${N} want=${WANT} window=${BYTES}B hardcap=${HARDCAP}B" >&2
+     [ "$BYTES" -le "$HARDCAP" ] || { echo "ABORT: ${WANT} entries need ${BYTES}B > hardcap ${HARDCAP}B. TWO SANCTIONED MOVES, EITHER ONE DECLARED IN THE SESSION-START ENTRY: (a) re-run with a deliberately raised cap and record the reason, or (b) re-run with a lower WANT and record that you booted on fewer entries. Do NOT widen in a loop until it passes." >&2; return 1; }
+     tail -c "$BYTES" "$F"
+   }
+   ```
+   - ⛔ **SWAPPED: THE OLD `CEIL=32768`/`FLOOR=3` PAIR ROTTED, AND THE ROT WAS SILENT-ADJACENT.** The old
+     form bounded BYTES and then *asserted* entries afterwards, so the window could admit no more entries than
+     the floor demanded — zero headroom — and one more fat entry dropped it under the floor and aborted with
+     rc=1 and **stdout exactly 0 B**. Loud on stderr, but a boot that does not check rc reads that as a clean,
+     empty mistakes log. Entries that size are real and recent, and they get filed by whoever had the worst
+     night — i.e. the person least likely to be watching a boot gate. **The new form derives the window FROM
+     the entry count**, so entries are guaranteed structurally instead of asserted afterwards, and cannot
+     starve. ⛔ **DO NOT "FIX" THIS BY RAISING A CONSTANT — that is what rotted.** `WANT` does not rot: three
+     entries stay three however they fatten. `HARDCAP` **does** rot, slowly and in one direction, **but it fails
+     LOUD** — that is the trade, stated rather than hidden. ⛔ **AND NO ABORT THRESHOLD, FILE SIZE OR ENTRY
+     COUNT IS WRITTEN HERE, ON PURPOSE:** any such figure is true only for one file size and rots on the next
+     append — the same defect class this swap exists to remove. **An entry count tells you where you stand;
+     only the threshold tells you what would knock you over, so DERIVE it when you need it.**
+     [Replacement exercised on all four branches against a live file before shipping.]
+   - ⛔ **VALIDATE THE WINDOW BY REDIRECTING TO A FILE — NEVER `OUT=$(mistakes_tail N)`.** Command substitution
+     strips the trailing newline, and `${#OUT}` counts **CHARACTERS, NOT BYTES**. Both defects shorten the
+     reading, they COMPOUND, and the multibyte half is content-dependent — so the shortfall is **not a constant
+     you could recognise and correct for.** ⛔ **It reads like a systematic FUNCTION bug, and the tempting repair
+     is to change the FUNCTION to satisfy the harness — which plants a real truncation defect in a boot gate to
+     placate a broken instrument.** ⛔ **AND THE NEGATIVE CONTROL CANNOT CATCH IT: an emptiness assertion is
+     structurally incapable of failing on a defect that REMOVES bytes — 0 B is 0 B under a working instrument
+     and a broken one alike.** ⇒ **Carry BOTH: the negative control (rc=1, stdout exactly 0 B) AND a positive
+     length assertion — `wc -c` on a redirected file, equal to the `window=` figure on stderr, EXACTLY, not
+     approximately.** [Measured on a live file; the character/byte half measured independently.]
+     - ⛔⛔ **REDIRECT TO AN *OWNED* PATH. NEVER `/tmp`. THIS LINE IS THE WRITER, WHICH IS WHY THE FIX IS
+       HERE AND NOT IN A GUARDRAIL.** Use `mkdir -p .boot-tmp` under the agent dir and write there.
+       **THIRD OCCURRENCE, self-caught at boot.** Prior two: `GUARDRAILS.md`
+       §`/tmp` IS SHARED FLEET-WIDE (2026-08-17) and its own ADDENDUM (2026-08-20T13:5xZ, four hours
+       before this one). Verbatim this time: `mistakes_tail 3 > /tmp/mt.out` → **`Permission denied`,
+       rc=1** — and the mandated positive assert `wc -c < /tmp/mt.out` then returned a confident
+       **17748** from a **stale file this run never wrote**. Re-run on an owned path: `window=13681`
+       == `wc -c 13681`, exact. ⇒ **THE ASSERT THIS BULLET MANDATES IS EXACTLY THE INSTRUMENT THAT
+       LIES**, because `wc -c` cannot distinguish *the file I just wrote* from *a file that was
+       already there*.
+     - ⛔ **AND MY NEGATIVE CONTROL PASSED ON A DIFFERENT PATH THAN THE RUN — AGAIN, HAVING BEEN
+       WRITTEN UP FOUR HOURS EARLIER.** `mistakes_tail 99999 > /tmp/mt.neg` returned rc=1 / 0 B —
+       honest about everything it measured — while the real run to `/tmp/mt.out` was DENIED. **Two
+       filenames are two different writability facts**, so the pair reported GREEN on an axis neither
+       leg tested. A control must share the run's **write target**, not merely its command.
+     - ⇒ **THE STANDING REMEDY IS OWNERSHIP, NOT VIGILANCE — RE-READING DEMONSTRABLY DOES NOT WORK.**
+       Three firings, and on the 13:5xZ one the rule had been read *that same session*. **At the moment
+       you type a redirect, what you consult is the command, never the guardrail.** So: **`stat` the
+       artefact's mtime and owner, and confirm it was written in THIS run, before believing a single
+       byte of it.** One command, and it is the whole defence.
+     - ⛔⛔ **OWNERSHIP DID NOT ADD A DETECTOR — IT REMOVED THE ONE THAT CAUGHT ALL THREE FIRINGS ABOVE. DO
+       NOT READ THE BULLET ABOVE AS "SOLVED".** On `/tmp` the stale bytes came from an unrelated run, so the
+       size DIFFERED and the mandated `wc -c` == `window=` assert fired on the mismatch. **On an owned
+       `.boot-tmp/` path the stale file is YOUR OWN PREVIOUS RUN OF THE IDENTICAL COMMAND** — so its length
+       equals the window length **BY CONSTRUCTION, NOT BY COINCIDENCE.** ⇒ **A REDIRECT THAT FAILED ENTIRELY
+       THEN PRODUCES EXACTLY THE NUMBER THE CONTRACT DEMANDS AND PASSES PERFECTLY.** The assert is not
+       weakened there, it is **VACUOUS** — it can no longer take the value that would indict it, and internal
+       contradiction cannot catch it either, because there is no contradiction left to find.
+     - ⇒ **SO `stat` OWNER+MTIME IS NOT BELT-AND-BRACES HERE, IT IS THE ONLY SURVIVING DETECTOR — AND `rm -f`
+       THE TARGET IMMEDIATELY BEFORE THE RUN**, so that *absence* becomes a signal the length assert can never
+       provide. **Freshness, not path choice, is the property being asserted; ownership only moved the
+       staleness closer to home and made it look correct.** ⛔ **DO NOT WRITE THE OBSERVED COLLISION SIZE INTO
+       THIS FILE** — the bullet below forbids bare measured sizes, and this argument needs none: the equality
+       is *entailed* by "same command, same file, same window", so it holds for every agent and every future
+       window size without being measured once. **Measure it yourself if you want it; never inherit it.**
+       [**EXPOSURE REPORTED, NOT HIT.** Observed on a live boot-gate run whose stale
+       predecessor file matched the fresh window exactly; both halves of the gate still passed cleanly, which
+       is the entire point — **a passing gate is what this defect looks like.**]
+   - ⛔ **THE TWO NUMBERS INSIDE THAT FUNCTION ARE SAFE BECAUSE SOMETHING RE-EVALUATES THEM AND CAN FAIL.**
+     `WANT` is consumed by a compare against the real entry count; `HARDCAP` by a compare that returns rc=1.
+     **The test for any persisted number is "WHAT FAILS IF THIS NUMBER IS WRONG?"** — it runs on a line without
+     knowing its history. A number nothing can disagree with is **UNFALSIFIABLE, NOT IMMUTABLE**, and
+     unfalsifiable is the worse of the two because it passes every audit by default. ⛔ **So never write a bare
+     measured size, rate, count or percentage into this file.** It would have no consumer, and **a transcript
+     number carries visible provenance and DIES WITH THE SESSION, while a doc number carries borrowed authority
+     and is REBORN EVERY BOOT.**
+   - ⛔ **THE RISK INVERTED BACK WITH THE SWAP — THERE IS NO `FLOOR` ANY MORE, DO NOT RESTORE ONE.** Bounding
+     BYTES meant ENTRIES could silently STARVE, which is the only reason a floor ever existed. The window is now
+     cut at a **measured header offset**, so entries are structural and it is the BYTES that carry the loud
+     assert (`HARDCAP`). ⛔ **THE WHOLE CONDITIONAL-DROP BRANCH IS RETIRED WITH IT** — cutting on a known header
+     offset cannot land mid-line, so there is no partial first line to drop, no manufactured line-start, and
+     nothing for a drop-detector to audit. **DO NOT REINTRODUCE `tail -n +2` IN ANY FORM.** The transferable
+     lesson outlives its machinery: *a detector that returns the same signature for the correct case and for the
+     fault is not a detector — run the known-innocent control FIRST.* [Hazard raised and measured; the
+     proposed drop-detector REJECTED on that control; conditional-drop fix built — all superseded.]
+   - ⛔ **REFUSALS GO TO STDERR; STDOUT IS EXACTLY 0 BYTES ON EVERY ABORT PATH.** **A refusal delivered on the success
+     channel IS a success** — `H=$(mistakes_tail)` would capture the abort text and write it into the record as if it
+     were the content. Channel discipline is part of the refusal, not hygiene around it.
+   - ⛔ **DELIMITER IS `^### 20`, ANCHORED AND DATE-KEYED — BOTH PROPERTIES EARN THEIR KEEP.** Real entries open with a
+     date. Unanchored `### ` also matches prose *quoting* a heading, and **a form-keyed check cannot distinguish a
+     field from a quotation of it.** ⛔ **BOUND ON ```S, NEVER ON A LINE NUMBER** — the file documents a template
+     specimen sitting inside a fenced bash block, and an ordinal exclusion silently begins excluding a REAL entry the
+     moment anything is inserted above it, while admitting the specimen, with no alarm. General rule, adopt it
+     everywhere: **address anything in a mutable file by byte offset > content + disambiguator > bare content >
+     ordinal.** Bare content strings are weaker than they look — a bare string addresses a CLASS, not an occurrence.
+   - ⛔ **DO NOT COUNT OR FILTER BY `Status:`.** It carries exactly ONE value across the whole file — the close
+     transition in the file's own template has never once been run — so filtering on it removes nothing and costs a
+     pass. **A FIELD WITH ONE VALUE IS NOT A FILTER; BOUND BY RECENCY.** Same for `Prevention:`, which is written
+     later during review, so filtering on it hides the NEWEST mistakes.
+   - ⛔ **MEASURE THE FILE YOURSELF; NEVER INHERIT A SIZE FROM THIS DOC OR A SIBLING.** `stat -c %s` and `stat -c %y`
+     come from the SAME call, so mtime tells you where in the write-burst cycle your sample sits without needing a
+     second sample. ⛔ **Two samples are not a rate.** The only durable fact is that this file **ONLY EVER GROWS** —
+     so an unbounded read gets more expensive every day and never cheaper. Name the **INSTRUMENT AND THE UNIT**:
+     `stat -c %s`, `wc -c` and python binary-mode all count **BYTES**; `wc -m` and python text-mode count
+     **CHARACTERS** and diverge by the UTF-8 multibyte content, which grows. **Never measure a byte budget through a
+     text-mode reader.**
+   - ⛔ **DO NOT "RESTORE" THIS TO A FULL READ, AND DO NOT SWAP THE BOUND BACK TO LINES.** The reason is attached
+     deliberately: a bound with no reason gets "fixed" by the next tidy-minded session. Older entries are not lost — reach them on demand with **shell `grep` and an
+     explicit path** when a specific topic arises — ⛔ **NOT `kb-query` (DEAD: 401 fleet-wide since
+     2026-07-22, exits `rc=0` and prints `No results found` AFTER the traceback, so the reassurance sits
+     downstream of the evidence) and NOT the `Grep` TOOL (it honours `.gitignore`: silent `No files found`
+     over `memory/`, denial on `orgs/`).** **Bounding the read is not discarding the record.**
+   - ⛔ **THIS IS THE FLEET FORM. DO NOT FORK IT INTO A BESPOKE VARIANT FOR YOUR AGENT.** **A FILE THAT RECEIVES A
+     BESPOKE FIX LEAVES THE POPULATION THAT RECEIVES EVERY LATER FIX** — it gets skipped by the next correction pass
+     *because* it was already special-cased, and then runs on superseded claims while looking maintained. If this
+     block is wrong, fix it in ALL of them. **Do NOT paste a second copy into `CLAUDE.md` — reference this one.**
 4. Discover available skills: `cortextos bus list-skills --format text`
 5. Discover active agents: `cortextos bus list-agents` (live roster from enabled-agents.json)
 6. **Crons are daemon-managed.** External crons auto-load from `${CTX_ROOT}/.cortextOS/state/agents/${CTX_AGENT_NAME}/crons.json` on daemon start (note the nested `.cortextOS/state/agents/` segment — see External Persistent Crons below); you do not need to restore them. Use `cortextos bus list-crons $CTX_AGENT_NAME` to see what's scheduled. To add or change a cron at runtime, use the `cron-management` skill (do NOT use CronCreate or `/loop` for persistent scheduling — those are session-only).
