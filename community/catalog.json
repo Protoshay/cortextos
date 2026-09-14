@@ -325,6 +325,18 @@
       "dependencies": [],
       "install_path": "community/skills/nighttime-mode",
       "submitted_at": "2026-04-06T00:00:00Z"
+    },
+    {
+      "name": "context-handoff-discipline",
+      "description": "Context-handoff discipline — before writing a handoff doc and running hard-restart on a daemon-injected context warning, re-measure context_status.json directly instead of trusting the injected percentage, and re-check it again immediately before executing the restart. Stands down instead of restarting if the session already self-resolved.",
+      "author": "cortextos",
+      "type": "skill",
+      "version": "1.0.0",
+      "tags": ["context", "handoff", "restart", "compaction"],
+      "review_status": "approved",
+      "dependencies": [],
+      "install_path": "community/skills/context-handoff-discipline",
+      "submitted_at": "2026-09-10T00:00:00Z"
     }
   ]
 }

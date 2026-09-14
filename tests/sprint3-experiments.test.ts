@@ -28,7 +28,9 @@ describe('Sprint 3: Experiment Framework', () => {
 
   describe('createExperiment', () => {
     it('generates valid ID and JSON', () => {
-      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'Shorter posts get more likes');
+      const id = createExperiment(testDir, 'testbot', 'engagement_rate', 'Shorter posts get more likes', {
+        baseline_value: 17.92,
+      });
       expect(id).toMatch(/^exp_\d+_[a-z0-9]{5}$/);
 
       const filePath = join(testDir, 'experiments', 'history', `${id}.json`);
@@ -40,7 +42,9 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(exp.metric).toBe('engagement_rate');
       expect(exp.hypothesis).toBe('Shorter posts get more likes');
       expect(exp.status).toBe('proposed');
-      expect(exp.baseline_value).toBe(0);
+      // 17.92 (not the old hardcoded 0) proves this is the caller's explicit
+      // input round-tripping, not a leftover static default.
+      expect(exp.baseline_value).toBe(17.92);
       expect(exp.result_value).toBeNull();
       expect(exp.decision).toBeNull();
       expect(exp.direction).toBe('higher');
@@ -52,6 +56,7 @@ describe('Sprint 3: Experiment Framework', () => {
 
     it('accepts optional surface, direction, window', () => {
       const id = createExperiment(testDir, 'testbot', 'bounce_rate', 'Less text = lower bounce', {
+        baseline_value: 0,
         surface: 'experiments/surfaces/bounce/current.md',
         direction: 'lower',
         window: '48h',
@@ -89,7 +94,9 @@ describe('Sprint 3: Experiment Framework', () => {
         }),
       );
 
-      const id = createExperiment(testDir, 'testbot', 'retention', 'Better onboarding improves retention');
+      const id = createExperiment(testDir, 'testbot', 'retention', 'Better onboarding improves retention', {
+        baseline_value: 0,
+      });
 
       const exp = JSON.parse(
         readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
@@ -125,6 +132,7 @@ describe('Sprint 3: Experiment Framework', () => {
       );
 
       const id = createExperiment(testDir, 'testbot', 'ctr', 'test', {
+        baseline_value: 0,
         direction: 'lower',
         measurement: 'custom-override',
       });
@@ -161,7 +169,7 @@ describe('Sprint 3: Experiment Framework', () => {
         }),
       );
 
-      const id = createExperiment(testDir, 'testbot', 'unrelated_metric', 'test');
+      const id = createExperiment(testDir, 'testbot', 'unrelated_metric', 'test', { baseline_value: 0 });
       const exp = JSON.parse(
         readFileSync(join(testDir, 'experiments', 'history', `${id}.json`), 'utf-8').trim(),
       );
@@ -169,11 +177,26 @@ describe('Sprint 3: Experiment Framework', () => {
       expect(exp.direction).toBe('higher'); // static default
       expect(exp.window).toBe('24h'); // static default
     });
+
+    it('rejects missing baseline_value', () => {
+      // @ts-expect-error - baseline_value is required; this test proves the
+      // runtime guard fires even when a caller manages to bypass the TS
+      // compile-time check (e.g. a plain-JS caller, or `undefined` passed
+      // explicitly through a spread).
+      expect(() => createExperiment(testDir, 'testbot', 'ctr', 'test', {})).toThrow(
+        'baseline_value is required',
+      );
+      expect(() =>
+        createExperiment(testDir, 'testbot', 'ctr', 'test', {
+          baseline_value: undefined as unknown as number,
+        }),
+      ).toThrow('baseline_value is required');
+    });
   });
 
   describe('runExperiment', () => {
     it('transitions proposed -> running', () => {
-      const id = createExperiment(testDir, 'testbot', 'ctr', 'Bold CTA improves CTR');
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'Bold CTA improves CTR', { baseline_value: 0 });
       const result = runExperiment(testDir, id, 'Changed button color to red');
 
       expect(result.status).toBe('running');
@@ -189,7 +212,7 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('throws if experiment is not proposed', () => {
-      const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline_value: 0 });
       runExperiment(testDir, id);
       expect(() => runExperiment(testDir, id)).toThrow("expected 'proposed'");
     });
@@ -198,6 +221,7 @@ describe('Sprint 3: Experiment Framework', () => {
   describe('evaluateExperiment', () => {
     it('keeps when higher is better and measured > baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'engagement', 'More emojis', {
+        baseline_value: 0,
         direction: 'higher',
       });
       runExperiment(testDir, id);
@@ -230,19 +254,21 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('discards when measured < baseline (direction=higher)', () => {
-      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images');
-      // Manually set a higher baseline by creating, running, evaluating once
-      // then creating a new experiment
+      // Explicit nonzero baseline (25) rather than the old hardcoded 0, so
+      // "NOT updated" below is provably about the discard decision, not an
+      // artifact of a leftover default.
+      const id = createExperiment(testDir, 'testbot', 'engagement', 'Remove images', { baseline_value: 25 });
       runExperiment(testDir, id);
 
-      // Measured 0 vs baseline 0 should discard (not strictly greater)
-      const result = evaluateExperiment(testDir, id, 0);
+      // Measured 10 vs baseline 25 should discard (not strictly greater)
+      const result = evaluateExperiment(testDir, id, 10);
       expect(result.decision).toBe('discard');
-      expect(result.baseline_value).toBe(0); // NOT updated
+      expect(result.baseline_value).toBe(25); // NOT updated
     });
 
     it('keeps when lower is better and measured < baseline', () => {
       const id = createExperiment(testDir, 'testbot', 'bounce_rate', 'Simplify nav', {
+        baseline_value: 0,
         direction: 'lower',
       });
       runExperiment(testDir, id);
@@ -252,15 +278,15 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('throws if experiment is not running', () => {
-      const id = createExperiment(testDir, 'testbot', 'ctr', 'test');
+      const id = createExperiment(testDir, 'testbot', 'ctr', 'test', { baseline_value: 0 });
       expect(() => evaluateExperiment(testDir, id, 10)).toThrow("expected 'running'");
     });
   });
 
   describe('listExperiments', () => {
     it('returns all experiments sorted by created_at desc', () => {
-      createExperiment(testDir, 'bot1', 'metric_a', 'hyp1');
-      createExperiment(testDir, 'bot2', 'metric_b', 'hyp2');
+      createExperiment(testDir, 'bot1', 'metric_a', 'hyp1', { baseline_value: 0 });
+      createExperiment(testDir, 'bot2', 'metric_b', 'hyp2', { baseline_value: 0 });
       const list = listExperiments(testDir);
       expect(list).toHaveLength(2);
       // Most recent first
@@ -270,8 +296,8 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('filters by status', () => {
-      const id1 = createExperiment(testDir, 'bot1', 'ctr', 'h1');
-      createExperiment(testDir, 'bot1', 'ctr', 'h2');
+      const id1 = createExperiment(testDir, 'bot1', 'ctr', 'h1', { baseline_value: 0 });
+      createExperiment(testDir, 'bot1', 'ctr', 'h2', { baseline_value: 0 });
       runExperiment(testDir, id1);
 
       const running = listExperiments(testDir, { status: 'running' });
@@ -283,8 +309,8 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('filters by metric', () => {
-      createExperiment(testDir, 'bot1', 'ctr', 'h1');
-      createExperiment(testDir, 'bot1', 'engagement', 'h2');
+      createExperiment(testDir, 'bot1', 'ctr', 'h1', { baseline_value: 0 });
+      createExperiment(testDir, 'bot1', 'engagement', 'h2', { baseline_value: 0 });
 
       const ctrOnly = listExperiments(testDir, { metric: 'ctr' });
       expect(ctrOnly).toHaveLength(1);
@@ -292,8 +318,8 @@ describe('Sprint 3: Experiment Framework', () => {
     });
 
     it('filters by agent', () => {
-      createExperiment(testDir, 'alpha', 'ctr', 'h1');
-      createExperiment(testDir, 'beta', 'ctr', 'h2');
+      createExperiment(testDir, 'alpha', 'ctr', 'h1', { baseline_value: 0 });
+      createExperiment(testDir, 'beta', 'ctr', 'h2', { baseline_value: 0 });
 
       const alphaOnly = listExperiments(testDir, { agent: 'alpha' });
       expect(alphaOnly).toHaveLength(1);
@@ -311,15 +337,15 @@ describe('Sprint 3: Experiment Framework', () => {
   describe('gatherContext', () => {
     it('calculates keep rate from completed experiments', () => {
       // Create 3 experiments: 2 keep, 1 discard
-      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1');
+      const id1 = createExperiment(testDir, 'testbot', 'engagement', 'h1', { baseline_value: 0 });
       runExperiment(testDir, id1);
       evaluateExperiment(testDir, id1, 10); // keep (10 > 0)
 
-      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2');
+      const id2 = createExperiment(testDir, 'testbot', 'engagement', 'h2', { baseline_value: 0 });
       runExperiment(testDir, id2);
       evaluateExperiment(testDir, id2, 5); // keep (5 > 0)
 
-      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3');
+      const id3 = createExperiment(testDir, 'testbot', 'engagement', 'h3', { baseline_value: 0 });
       runExperiment(testDir, id3);
       evaluateExperiment(testDir, id3, 0); // discard (0 not > 0)
 

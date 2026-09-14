@@ -28,6 +28,7 @@ export interface Experiment {
 }
 
 export interface ExperimentCreateOptions {
+  baseline_value: number;
   surface?: string;
   direction?: 'higher' | 'lower';
   window?: string;
@@ -147,14 +148,28 @@ function saveConfig(agentDir: string, config: ExperimentConfig): void {
  * fallback, repeat experiments on that metric stop losing the measurement
  * description because the agent forgot to pass --measurement.
  * Explicit options always win over the cycle so ad-hoc overrides still work.
+ *
+ * `baseline_value` is the one exception to the cycle-fallback story above:
+ * it has no cycle fallback and no static default. It must be passed
+ * explicitly by the caller as the real pre-experiment measurement of the
+ * metric. There is no sensible value to invent on its behalf — defaulting
+ * it silently (formerly a hardcoded 0) would make every experiment's
+ * keep/discard decision compare the result against a fabricated baseline
+ * instead of the metric's actual starting point.
  */
 export function createExperiment(
   agentDir: string,
   agentName: string,
   metric: string,
   hypothesis: string,
-  options?: ExperimentCreateOptions,
+  options: ExperimentCreateOptions,
 ): string {
+  if (options.baseline_value === undefined || options.baseline_value === null) {
+    throw new Error(
+      'createExperiment: baseline_value is required — pass the real pre-experiment measurement of the metric. There is no default.',
+    );
+  }
+
   const epoch = Math.floor(Date.now() / 1000);
   const rand = randomString(5);
   const id = `exp_${epoch}_${rand}`;
@@ -166,12 +181,12 @@ export function createExperiment(
     agent: agentName,
     metric,
     hypothesis,
-    surface: options?.surface ?? cycleDefaults.surface ?? '',
-    direction: options?.direction ?? cycleDefaults.direction ?? 'higher',
-    window: options?.window ?? cycleDefaults.window ?? '24h',
-    measurement: options?.measurement ?? cycleDefaults.measurement ?? '',
+    surface: options.surface ?? cycleDefaults.surface ?? '',
+    direction: options.direction ?? cycleDefaults.direction ?? 'higher',
+    window: options.window ?? cycleDefaults.window ?? '24h',
+    measurement: options.measurement ?? cycleDefaults.measurement ?? '',
     status: 'proposed',
-    baseline_value: 0,
+    baseline_value: options.baseline_value,
     result_value: null,
     decision: null,
     learning: '',
