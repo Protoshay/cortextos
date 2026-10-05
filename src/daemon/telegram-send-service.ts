@@ -151,8 +151,8 @@ export class TelegramSendService {
    * Run ALL gates and the checker, then send (or reject).
    * Called by the IPC server 'send-human-message' handler.
    *
-   * Bounded by: checkerConfig.timeoutMs (8 s) + Telegram API timeout (15 s).
-   * The IPC client should use a 35 s timeout for this command type.
+   * Bounded by: the Codex checker budget (45 s, CODEX_TOTAL_BUDGET_MS) + Telegram API timeout (15 s).
+   * The IPC client uses 75 s (HUMAN_MESSAGE_IPC_TIMEOUT_MS) for this command type.
    */
   async handleSendRequest(req: HumanSendRequest): Promise<HumanSendResult> {
     const startMs = Date.now();

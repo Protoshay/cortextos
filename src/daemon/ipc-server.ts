@@ -5,6 +5,7 @@ import type { IPCRequest, IPCResponse, CronSummaryRow, CronDefinition } from '..
 import { AgentManager } from './agent-manager.js';
 import type { HumanSendRequest } from './telegram-send-service.js';
 import { getIpcPath } from '../utils/paths.js';
+import { HUMAN_MESSAGE_IPC_TIMEOUT_MS } from '../telegram/checker.js';
 import { readCrons, getExecutionLog, getExecutionLogPage, addCron, updateCron, removeCron, getCronByName } from '../bus/crons.js';
 import type { ExecutionLogStatusFilter } from '../bus/crons.js';
 import { nextFireFromCron } from './cron-scheduler.js';
@@ -894,8 +895,8 @@ export class IPCServer {
           const source: HumanSendRequest['source'] =
             d.source === 'hook' ? 'hook' : 'cli';
 
-          // Await is safe: handleSendRequest is bounded by checkerConfig.timeoutMs (8 s)
-          // plus Telegram API timeout (15 s). IPC client uses 35 s for this command type.
+          // Await is safe: handleSendRequest is bounded by the Codex checker budget (45 s)
+          // plus Telegram API timeout (15 s). IPC client uses 75 s for this command type.
           const result = await svc.handleSendRequest({
             agentName: request.agent,
             chatId: d.chatId,
@@ -981,14 +982,14 @@ export class IPCClient {
   /**
    * Send a command to the daemon and get the response.
    *
-   * The 'send-human-message' command uses a 35 s timeout (8 s checker +
+   * The 'send-human-message' command uses a 75 s timeout (45 s checker +
    * 15 s Telegram API + buffer). All other commands use the default 5 s.
    */
   async send(request: IPCRequest): Promise<IPCResponse> {
     const { createConnection } = require('net');
 
-    // 'send-human-message' is bounded by checker (8 s) + Telegram API (15 s)
-    const timeoutMs = request.type === 'send-human-message' ? 35_000 : 5_000;
+    // 'send-human-message' is bounded by the Codex checker budget (45 s) + Telegram API (15 s)
+    const timeoutMs = request.type === 'send-human-message' ? HUMAN_MESSAGE_IPC_TIMEOUT_MS : 5_000;
 
     return new Promise((resolve, reject) => {
       const socket = createConnection(this.socketPath, () => {

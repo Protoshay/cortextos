@@ -661,6 +661,128 @@ export function createOpenAIClient(apiKey: string, config: CheckerConfig): Model
 }
 
 /**
+ * Codex checker budget. The whole check (all attempts) must finish inside this,
+ * and the IPC client timeout for human sends must exceed it plus the Telegram
+ * API timeout (15 s) — see HUMAN_MESSAGE_IPC_TIMEOUT_MS.
+ * Measured 2026-10-05: a bare `codex exec` takes ~22 s even at idle load, so
+ * the old 20 s cap timed out healthy runs.
+ */
+export const CODEX_TOTAL_BUDGET_MS = 45_000;
+/**
+ * Hard ceiling on a configured budget (config/daemon.json message_checker.timeout_ms): a config value
+ * can RAISE the budget above the 45 s default but never past this, so the 75 s IPC client timeout
+ * (HUMAN_MESSAGE_IPC_TIMEOUT_MS) always exceeds budget + 15 s Telegram. A config value BELOW 45 s is
+ * ignored on purpose: the old 8 s default and the 30 s stopgap both sit under the measured ~22 s idle
+ * run + retry headroom.
+ */
+export const CODEX_MAX_BUDGET_MS = 55_000;
+/** Only retry an overload when at least this much of the budget is left. */
+export const CODEX_RETRY_MIN_BUDGET_MS = 15_000;
+/** 45 s checker + 15 s Telegram + margin. Used by the IPC client for send-human-message. */
+export const HUMAN_MESSAGE_IPC_TIMEOUT_MS = 75_000;
+
+/**
+ * Extract the real failure reason from `codex exec --json` stdout.
+ * A failing run emits {"type":"error",...} and {"type":"turn.failed","error":{...}}.
+ * NOTE: {"type":"item.completed","item":{"type":"error"}} is a NON-FATAL
+ * diagnostic that also appears on successful runs and must be ignored.
+ */
+export function extractCodexError(stdout: string): string | null {
+  let failed: string | null = null;
+  let bare: string | null = null;
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line) as {
+        type?: string;
+        message?: string;
+        error?: { message?: string; codex_error_info?: string };
+      };
+      if (e.type === 'turn.failed' && e.error?.message) {
+        failed = e.error.codex_error_info
+          ? `${e.error.message} [${e.error.codex_error_info}]`
+          : e.error.message;
+      } else if (e.type === 'error' && typeof e.message === 'string') {
+        bare = e.message;
+      }
+    } catch {
+      // non-JSON diagnostics
+    }
+  }
+  return failed ?? bare;
+}
+
+/**
+ * Failure text for a non-zero exit. Prefers the structured error from stdout;
+ * falls back to the stderr TAIL (the head is startup noise such as
+ * "Reading additional input from stdin..." and non-fatal skill-load errors,
+ * which is what hid the real cause on 2026-10-05).
+ */
+export function formatCodexFailure(stdout: string, stderr: string, code: number | null): string {
+  const detail = extractCodexError(stdout) ?? stderr.trim().slice(-300);
+  return `Codex checker exited ${code}: ${detail.slice(0, 300)}`;
+}
+
+export function isCodexOverload(message: string): boolean {
+  return /at capacity|server_overloaded/i.test(message);
+}
+
+/**
+ * Run one `codex exec` attempt. The child is its own process group so a
+ * timeout kills the node wrapper AND the vendored rust child (killing only
+ * the wrapper left the rust process orphaned under PID 1 for 10-20 min).
+ */
+function runCodexOnce(
+  prompt: string,
+  model: string,
+  timeoutMs: number,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const child = spawn('codex', [
+      'exec',
+      '--skip-git-repo-check',
+      '--model', model,
+      '--sandbox', 'read-only',
+      '--json',
+      prompt,
+    ], {
+      cwd: '/tmp',
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
+    });
+    child.stdin.end();
+    let output = '';
+    let stderr = '';
+    const killGroup = (): void => {
+      try {
+        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+        else child.kill('SIGKILL');
+      } catch {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
+    };
+    const timer = setTimeout(() => {
+      killGroup();
+      reject(new Error(`Codex checker timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => { output += String(chunk); });
+    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      killGroup();
+      reject(new Error(`Codex checker error: ${err.message}`));
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve(output);
+      else reject(new Error(formatCodexFailure(output, stderr, code)));
+    });
+  });
+}
+
+/**
  * Create a ModelClient backed by the host's locally authenticated Codex CLI.
  * The paid API key is deliberately removed so reviewer availability does not
  * depend on a separate API credit balance.
@@ -679,39 +801,23 @@ export function createCodexClient(config: CheckerConfig): ModelClient {
       const childEnv = { ...process.env };
       delete childEnv.OPENAI_API_KEY;
 
-      const timeoutMs = Math.max(config.timeoutMs, 20_000);
-      const stdout = await new Promise<string>((resolve, reject) => {
-        const child = spawn('codex', [
-          'exec',
-          '--skip-git-repo-check',
-          '--model', config.model,
-          '--sandbox', 'read-only',
-          '--json',
-          prompt,
-        ], {
-          cwd: '/tmp',
-          env: childEnv,
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-        child.stdin.end();
-        let output = '';
-        let stderr = '';
-        const timer = setTimeout(() => {
-          child.kill('SIGKILL');
-          reject(new Error(`Codex checker timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-        child.stdout.on('data', (chunk) => { output += String(chunk); });
-        child.stderr.on('data', (chunk) => { stderr += String(chunk); });
-        child.on('error', (err) => {
-          clearTimeout(timer);
-          reject(new Error(`Codex checker error: ${err.message}`));
-        });
-        child.on('close', (code) => {
-          clearTimeout(timer);
-          if (code === 0) resolve(output);
-          else reject(new Error(`Codex checker exited ${code}: ${stderr.slice(0, 200)}`));
-        });
-      });
+      // One shared deadline across attempts (see CODEX_TOTAL_BUDGET_MS).
+      const totalMs = Math.min(Math.max(config.timeoutMs, CODEX_TOTAL_BUDGET_MS), CODEX_MAX_BUDGET_MS);
+      const deadline = Date.now() + totalMs;
+      let stdout: string;
+      try {
+        stdout = await runCodexOnce(prompt, config.model, totalMs, childEnv);
+      } catch (err) {
+        // Overload is transient and returns fast (~5 s), so ONE retry is cheap.
+        // Never retry a timeout (it would only double a hang) or any other error.
+        const remaining = deadline - Date.now();
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isCodexOverload(msg) && remaining >= CODEX_RETRY_MIN_BUDGET_MS) {
+          stdout = await runCodexOnce(prompt, config.model, remaining, childEnv);
+        } else {
+          throw err;
+        }
+      }
 
       let outputText = '';
       for (const line of stdout.split('\n')) {
